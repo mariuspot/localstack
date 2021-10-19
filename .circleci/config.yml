@@ -6,7 +6,7 @@ version: 2.1
 jobs:
   install:
     machine:
-      image: ubuntu-2004:202101-01
+      image: ubuntu-2004:202107-02
     working_directory: /tmp/workspace/repo
     steps:
       - checkout
@@ -55,7 +55,7 @@ jobs:
 
   itest-lambda-docker:
     machine:
-      image: ubuntu-2004:202101-01
+      image: ubuntu-2004:202107-02
     working_directory: /tmp/workspace/repo
     steps:
       - attach_workspace:
@@ -115,7 +115,7 @@ jobs:
 
   itest-elasticmq:
     machine:
-      image: ubuntu-2004:202101-01
+      image: ubuntu-2004:202107-02
     working_directory: /tmp/workspace/repo
     steps:
       - attach_workspace:
@@ -140,9 +140,9 @@ jobs:
       - store_test_results:
           path: target/reports/
 
-  docker-build:
+  docker-build-amd64:
     machine:
-      image: ubuntu-2004:202101-01
+      image: ubuntu-2004:202107-02
     working_directory: /tmp/workspace/repo
     steps:
       - attach_workspace:
@@ -152,26 +152,22 @@ jobs:
           command: make init
       - run:
           name: Build localstack docker image
-          command: make docker-build
+          command: make docker-build-linux-amd64
       - run:
-          name: Extract build reports
-          command: |
-            if [[ "$(docker image ls -q localstack/localstack 2> /dev/null)" != "" ]]; then
-              cid=$(docker create localstack/localstack)
-            else
-              cid=$(docker ps -aq | head -n1)
-            fi
-
-            [[ "$cid" != "" ]] || { echo "could not create build container"; exit 1; }
-
-            docker cp ${cid}:/opt/code/localstack/target/test-report.xml target/reports || true
-            docker cp ${cid}:/opt/code/localstack/.coverage ./target/coverage/.coverage.docker_build || true
-          when: always
+          name: Output the Image Size
+          command: docker image inspect localstack/localstack:latest --format='{{.Size}}'
+      - run:
+          name: Output the image layer history
+          command: docker history localstack/localstack:latest
+      # - run:
+      #     name: Run the tests
+      #     command: |
+      #       PYTEST_ARGS='--junitxml=target/reports/test-report-amd64.xml' \
+      #       COVERAGE_FILE='target/coverage/.coverage.amd64' \
+      #       make docker-run-tests
       - run:
           name: Save docker image
-          command: |
-            test "$CIRCLE_BRANCH" = "master" \
-              && docker save localstack/localstack:latest -o target/localstack-docker-image.tar || true
+          command: docker save localstack/localstack:latest -o target/localstack-docker-image-amd64.tar
       - persist_to_workspace:
           root:
             /tmp/workspace
@@ -179,6 +175,112 @@ jobs:
             - repo
       - store_test_results:
           path: target/reports/
+
+  docker-run-tests-amd64:
+    machine:
+      image: ubuntu-2004:202107-02
+    parallelism: 4
+    working_directory: /tmp/workspace/repo
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Load docker image
+          command: docker load -i target/localstack-docker-image-amd64.tar
+      - run:
+          name: Run the tests
+          command: |
+            FILE_LIST=$(circleci tests glob "tests/**/test_*.py" | circleci tests split --split-by=timings --show-counts)
+            export TEST_PATH="${FILE_LIST//$'\n'/ }"
+            export COVERAGE_FILE="target/coverage/.coverage.${CIRCLE_NODE_INDEX}.amd64"
+            export PYTEST_ARGS="-o junit_family=xunit1 --junitxml=target/reports/${CIRCLE_NODE_INDEX}-test-report-amd64.xml"
+            make docker-run-tests
+      - store_test_results:
+          path: target/reports/
+      - store_artifacts:
+          path: target/reports
+
+  docker-build-arm64:
+    machine:
+      # The latest version of ubuntu is not yet supported for ARM: https://circleci.com/docs/2.0/arm-resources/
+      image: ubuntu-2004:202101-01
+    resource_class: arm.medium
+    working_directory: /tmp/workspace/repo
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          # Since we are using an old version of ubuntu, we need to install the latest version of docker
+          name: Update docker engine to most current
+          command: |
+            # Remove old version
+            sudo apt-get remove --purge docker docker-engine docker.io containerd runc -y
+            # Install Docker deb package repo
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+              sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+            echo "deb [arch=arm64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+              | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update
+            # Install the latest version of Docker and haveged
+            # (https://github.com/docker/compose/issues/6678#issuecomment-526831488)
+            sudo apt-get install docker-ce docker-ce-cli containerd.io haveged -y
+            sudo usermod -aG docker $USER
+      - run:
+          name: Build localstack docker image
+          command: make docker-build-linux-arm64
+      - run:
+          name: Output the Image Size
+          command: docker image inspect localstack/localstack:latest --format='{{.Size}}'
+      - run:
+          name: Output the image layer history
+          command: docker history localstack/localstack:latest
+      - run:
+          name: Install amd64 emulation support for lambda tests
+          command: |
+            docker run --rm --privileged tonistiigi/binfmt:latest --install all
+            docker buildx create --name multiarch-builder --use
+      # - run:
+      #     name: Run the tests
+      #     command: |
+      #       PYTEST_ARGS='--junitxml=target/reports/test-report-arm64.xml' \
+      #       COVERAGE_FILE='target/coverage/.coverage.arm64' \
+      #       make docker-run-tests
+      - run:
+          name: Save docker image
+          command: docker save localstack/localstack:latest -o target/localstack-docker-image-arm64.tar || true
+      - persist_to_workspace:
+          root:
+            /tmp/workspace
+          paths:
+            - repo
+      - store_test_results:
+          path: target/reports/
+
+  docker-run-tests-arm64:
+    machine:
+      # The latest version of ubuntu is not yet supported for ARM: https://circleci.com/docs/2.0/arm-resources/
+      image: ubuntu-2004:202101-01
+    resource_class: arm.medium
+    parallelism: 1
+    working_directory: /tmp/workspace/repo
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Load docker image
+          command: docker load -i target/localstack-docker-image-arm64.tar
+      - run:
+          name: Run the tests
+          command: |
+            FILE_LIST=$(circleci tests glob "tests/**/test_*.py" | circleci tests split --split-by=timings --show-counts)
+            export TEST_PATH="${FILE_LIST//$'\n'/ }"
+            export COVERAGE_FILE="target/coverage/.coverage.${CIRCLE_NODE_INDEX}.arm64"
+            export PYTEST_ARGS="-o junit_family=xunit1 --junitxml=target/reports/${CIRCLE_NODE_INDEX}-test-report-arm64.xml"
+            make docker-run-tests
+      - store_test_results:
+          path: target/reports/
+      - store_artifacts:
+          path: target/reports
 
   report:
     docker:
@@ -208,22 +310,51 @@ jobs:
       - store_artifacts:
           path: htmlcov/
 
-  docker-push:
+  docker-push-amd64:
     machine:
-      image: ubuntu-2004:202101-01
+      image: ubuntu-2004:202107-02
     working_directory: /tmp/workspace/repo
     steps:
       - attach_workspace:
           at: /tmp/workspace
       - run:
           name: Load docker image
-          command: docker load -i target/localstack-docker-image.tar
+          command: docker load -i target/localstack-docker-image-amd64.tar
       - run:
           name: Run pre-release smoke tests
           command: make ci-pro-smoke-tests
       - run:
           name: Push docker image
-          command: make docker-push-master
+          command: make docker-push-master-amd64
+
+  docker-push-arm64:
+    machine:
+      image: ubuntu-2004:202101-01
+    resource_class: arm.medium
+    working_directory: /tmp/workspace/repo
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Load docker image
+          command: docker load -i target/localstack-docker-image-arm64.tar
+      - run:
+          name: Run pre-release smoke tests
+          command: make ci-pro-smoke-tests
+      - run:
+          name: Push docker image
+          command: make docker-push-master-arm64
+
+  docker-create-manifests:
+    machine:
+      image: ubuntu-2004:202107-02
+    working_directory: /tmp/workspace/repo
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: create multi-platform manifests
+          command: make docker-create-manifests
 
 
 workflows:
@@ -239,19 +370,49 @@ workflows:
       - itest-elasticmq:
           requires:
             - preflight
-      - docker-build:
+      - docker-build-amd64:
           requires:
             - preflight
+      - docker-run-tests-amd64:
+          requires:
+            - docker-build-amd64
+      - docker-build-arm64:
+          requires:
+            - preflight
+      - docker-run-tests-arm64:
+          requires:
+            - docker-build-arm64
       - report:
           requires:
             - itest-lambda-docker
             - itest-elasticmq
-            - docker-build
-      - docker-push:
+            - docker-run-tests-amd64
+      - docker-push-amd64:
           filters:
             branches:
               only: master
           requires:
             - itest-lambda-docker
             - itest-elasticmq
-            - docker-build
+            - docker-build-amd64
+            - docker-run-tests-amd64
+            - docker-build-arm64
+            - docker-run-tests-arm64
+      - docker-push-arm64:
+          filters:
+            branches:
+              only: master
+          requires:
+            - itest-lambda-docker
+            - itest-elasticmq
+            - docker-build-amd64
+            - docker-run-tests-amd64
+            - docker-build-arm64
+            - docker-run-tests-arm64
+      - docker-create-manifests:
+          filters:
+            branches:
+              only: master
+          requires:
+            - docker-push-amd64
+            - docker-push-arm64
