@@ -1,18 +1,15 @@
-FROM python:3.8-slim-buster as java-builder
+ARG IMAGE_TYPE=full
 
-ARG TARGETOS
+# java-builder: Stage to build a custom JRE (with jlink)
+FROM python:3.8-slim-buster as java-builder
 ARG TARGETARCH
 
-# Install final dependencies
-RUN apt-get update && \
-        apt-get install -y --no-install-recommends \
-        openjdk-11-jdk-headless && \
-        apt-get clean && rm -rf /var/lib/apt/lists/*
-
-SHELL [ "/bin/bash", "-c" ]
+# install OpenJDK 11
+RUN apt-get update && apt-get install -y openjdk-11-jdk-headless
 
 ENV JAVA_HOME /usr/lib/jvm/java-11-openjdk-${TARGETARCH}
-# create a custom, minimized JRE via jlink
+
+# reate a custom, minimized JRE via jlink
 RUN jlink --add-modules \
 # include required modules
 java.base,java.desktop,java.instrument,java.management,java.naming,java.scripting,java.sql,java.xml,jdk.compiler,\
@@ -34,33 +31,36 @@ jdk.localedata --include-locales en,th \
 
 
 
+# base: Stage which installs necessary runtime dependencies (OS packages, java, maven,...)
 FROM python:3.8-slim-buster as base
-
-ARG TARGETOS
 ARG TARGETARCH
 
-ARG LOCALSTACK_BUILD_DATE
-ARG LOCALSTACK_BUILD_GIT_HASH
-
-ENV LOCALSTACK_BUILD_DATE=${LOCALSTACK_BUILD_DATE}
-ENV LOCALSTACK_BUILD_GIT_HASH=${LOCALSTACK_BUILD_GIT_HASH}
-
-LABEL authors="LocalStack Contributors"
-LABEL maintainer="Waldemar Hummer (waldemar.hummer@gmail.com)"
-LABEL description="LocalStack Docker image"
-
-# Install final dependencies
+# Install runtime OS package dependencies
 RUN apt-get update && \
-        # Setup Node 14 Dependencies
-        apt-get install -y --no-install-recommends curl && \
+        # Install dependencies to add additional repos
+        apt-get install -y --no-install-recommends ca-certificates curl && \
+        # Setup Node 14 Repo
         curl -sL https://deb.nodesource.com/setup_14.x | bash - && \
         # Install Packages
         apt-get update && \
         apt-get install -y --no-install-recommends \
-        git make nodejs openssl tar pixz zip unzip && \
+            # Runtime packages (groff-base is necessary for AWS CLI help)
+            git make openssl tar pixz zip unzip groff-base iputils-ping nss-passwords \
+            # Postgres
+            postgresql postgresql-client postgresql-plpython3 \
+            # NodeJS
+            nodejs && \
         apt-get clean && rm -rf /var/lib/apt/lists/*
 
 SHELL [ "/bin/bash", "-c" ]
+
+# install Docker (CLI only)
+RUN DOCKER_VERSION=20.10.7; \
+  TARGETARCH_SYNONYM=$([[ "$TARGETARCH" == "amd64" ]] && echo "x86_64" || echo "aarch64"); \
+  curl -fsSLO https://download.docker.com/linux/static/stable/${TARGETARCH_SYNONYM}/docker-${DOCKER_VERSION}.tgz \
+  && tar xzvf docker-${DOCKER_VERSION}.tgz \
+  && mv docker/docker /usr/local/bin \
+  && rm -r docker docker-${DOCKER_VERSION}.tgz
 
 # Install Java 11
 ENV LANG C.UTF-8
@@ -69,8 +69,6 @@ RUN { \
         echo 'dirname "$(dirname "$(readlink -f "$(which javac || which java)")")"'; \
     } > /usr/local/bin/docker-java-home \
     && chmod +x /usr/local/bin/docker-java-home
-
-
 COPY --from=java-builder /usr/lib/jvm/java-11 /usr/lib/jvm/java-11
 COPY --from=java-builder /etc/ssl/certs/java /etc/ssl/certs/java
 COPY --from=java-builder /etc/java-11-openjdk/security /etc/java-11-openjdk/security
@@ -82,11 +80,11 @@ ENV PATH "${PATH}:${JAVA_HOME}/bin"
 # https://github.com/carlossg/docker-maven/blob/master/openjdk-11/Dockerfile)
 ARG MAVEN_VERSION=3.6.3
 ARG USER_HOME_DIR="/root"
-ARG SHA=26ad91d751b3a9a53087aefa743f4e16a17741d3915b219cf74112bf87a438c5
-ARG BASE_URL=https://apache.osuosl.org/maven/maven-3/${MAVEN_VERSION}/binaries
+ARG MAVEN_SHA=26ad91d751b3a9a53087aefa743f4e16a17741d3915b219cf74112bf87a438c5
+ARG MAVEN_BASE_URL=https://apache.osuosl.org/maven/maven-3/${MAVEN_VERSION}/binaries
 RUN mkdir -p /usr/share/maven /usr/share/maven/ref \
-  && curl -fsSL -o /tmp/apache-maven.tar.gz ${BASE_URL}/apache-maven-$MAVEN_VERSION-bin.tar.gz \
-  && echo "${SHA}  /tmp/apache-maven.tar.gz" | sha256sum -c - \
+  && curl -fsSL -o /tmp/apache-maven.tar.gz ${MAVEN_BASE_URL}/apache-maven-$MAVEN_VERSION-bin.tar.gz \
+  && echo "${MAVEN_SHA}  /tmp/apache-maven.tar.gz" | sha256sum -c - \
   && tar -xzf /tmp/apache-maven.tar.gz -C /usr/share/maven --strip-components=1 \
   && rm -f /tmp/apache-maven.tar.gz \
   && ln -s /usr/share/maven/bin/mvn /usr/bin/mvn
@@ -102,23 +100,8 @@ WORKDIR /opt/code/localstack/
 ADD localstack/package.json localstack/package.json
 RUN cd localstack && npm install && rm -rf /root/.npm;
 
-# install supervisor
-RUN pip3 install supervisor
-
-# init environment and cache some dependencies
-ARG DYNAMODB_ZIP_URL=https://s3-us-west-2.amazonaws.com/dynamodb-local/dynamodb_local_latest.zip
-RUN mkdir -p /opt/code/localstack/localstack/infra && \
-    mkdir -p /opt/code/localstack/localstack/infra/dynamodb && \
-      curl -L -o /tmp/localstack.ddb.zip ${DYNAMODB_ZIP_URL} && \
-      (cd localstack/infra/dynamodb && unzip -q /tmp/localstack.ddb.zip && rm /tmp/localstack.ddb.zip) && \
-    curl -L -o /tmp/elasticmq-server.jar \
-        https://s3-eu-west-1.amazonaws.com/softwaremill-public/elasticmq-server-1.1.0.jar
-
-# final fixes
-RUN which python || ln -s /usr/bin/python3 /usr/bin/python
-
-# install basic tools to final image
-RUN pip install awscli-local requests --upgrade
+# install basic (global) tools to final image
+RUN pip install --no-cache-dir --upgrade supervisor virtualenv
 
 # install supervisor config file and entrypoint script
 ADD bin/supervisord.conf /etc/supervisord.conf
@@ -127,135 +110,88 @@ ADD bin/docker-entrypoint.sh /usr/local/bin/
 # expose default environment
 # Set edge bind host so localstack can be reached by other containers
 # set library path and default LocalStack hostname
-ENV MAVEN_CONFIG=/opt/code/localstack \
-    LD_LIBRARY_PATH=/usr/lib/jvm/java-11/lib:/usr/lib/jvm/java-11/lib/server \
-    USER=localstack \
-    PYTHONUNBUFFERED=1 \
-    EDGE_BIND_HOST=0.0.0.0 \
-    LOCALSTACK_HOSTNAME=localhost
+ENV MAVEN_CONFIG=/opt/code/localstack
+ENV LD_LIBRARY_PATH=/usr/lib/jvm/java-11/lib:/usr/lib/jvm/java-11/lib/server
+ENV USER=localstack
+ENV PYTHONUNBUFFERED=1
+ENV EDGE_BIND_HOST=0.0.0.0
+ENV LOCALSTACK_HOSTNAME=localhost
+
+# Create the infra folder (will be populated later)
+RUN mkdir -p /opt/code/localstack/localstack/infra
 
 RUN mkdir /root/.serverless; chmod -R 777 /root/.serverless
 
 # add trusted CA certificates to the cert store
 RUN curl https://letsencrypt.org/certs/letsencryptauthorityx3.pem.txt >> /etc/ssl/certs/ca-certificates.crt
 
-# expose edge service, ElasticSearch & debugpy ports
-EXPOSE 4566 4571 5678
-
-# define command at startup
-ENTRYPOINT ["docker-entrypoint.sh"]
 
 
+# base-arm64: Stage which sets a different Kenesis provider
+# (workaround for https://github.com/localstack/localstack/issues/4358)
 FROM base as base-arm64
-# Work around crashes in Kenesis with error -11
-# https://github.com/localstack/localstack/issues/4358
 ENV KINESIS_PROVIDER=kinesalite
 
 
+
+# base-amd64: Stage which sets the default Kenesis provider
+# (workaround for https://github.com/localstack/localstack/issues/4358)
 FROM base as base-amd64
 ENV KINESIS_PROVIDER=kinesis-mock
 
 
+
+# builder: Stage which installs/builds the dependencies and infra-components of LocalStack
 FROM base-${TARGETARCH} as builder
+ARG TARGETARCH
 
 # Install build dependencies to base
 RUN apt-get update && apt-get install -y autoconf automake cmake libsasl2-dev \
         g++ gcc libffi-dev libkrb5-dev libssl-dev \
         postgresql-server-dev-11 libpq-dev
 
-# installing terraform temporary - removed in the final docker image
-ARG TERRAFORM_ZIP_URL=https://releases.hashicorp.com/terraform/0.15.5/terraform_0.15.5_linux_${TARGETARCH}.zip
-RUN mkdir -p /opt/terraform && \
-    curl -L -o /opt/terraform/terraform.zip ${TERRAFORM_ZIP_URL} && \
-    (cd /opt/terraform && unzip -q /opt/terraform/terraform.zip && rm /opt/terraform/terraform.zip)
-ENV PATH="${PATH}:/opt/terraform"
+# Install timescaledb into postgresql
+RUN (cd /tmp && git clone https://github.com/timescale/timescaledb.git) && \
+    (cd /tmp/timescaledb && git checkout 2.0.0-rc4 && ./bootstrap -DREGRESS_CHECKS=OFF && \
+      cd build && make && make install) && \
+    rm -rf /tmp/timescaledb
 
-ADD requirements.txt .
-RUN (pip3 install --upgrade pip) && \
-    (test `which virtualenv` || pip3 install virtualenv || sudo pip3 install virtualenv) && \
-    (virtualenv .venv && source .venv/bin/activate && \
-        pip3 install --upgrade pip && \
-        pip3 install Cython && \
-        export CPATH=/usr/include/python3.9 && \
-        pip3 install -r requirements.txt && \
-        rm -rf .venv) || exit 1
-
-# install libs that require dependencies that are cleaned up below (e.g., gcc)
-RUN (virtualenv .venv && source .venv/bin/activate && pip install 'cryptography<3.4' 'uamqp>=1.2.14' 'coverage[toml]>=5.5')
-
-# install basic tools for build
-RUN pip install awscli --upgrade
+# init environment and cache some dependencies
+ARG DYNAMODB_ZIP_URL=https://s3-us-west-2.amazonaws.com/dynamodb-local/dynamodb_local_latest.zip
+RUN mkdir -p /opt/code/localstack/localstack/infra/dynamodb && \
+      curl -L -o /tmp/localstack.ddb.zip ${DYNAMODB_ZIP_URL} && \
+      (cd localstack/infra/dynamodb && unzip -q /tmp/localstack.ddb.zip && rm /tmp/localstack.ddb.zip) && \
+    curl -L -o /opt/code/localstack/localstack/infra/elasticmq-server.jar \
+        https://s3-eu-west-1.amazonaws.com/softwaremill-public/elasticmq-server-1.1.0.jar
 
 # upgrade python build tools
-RUN (virtualenv .venv && source .venv/bin/activate && pip install --upgrade pip wheel setuptools localstack-plugin-loader)
+RUN (virtualenv .venv && source .venv/bin/activate && pip3 install --upgrade pip wheel setuptools)
 
-# add configuration and source files
+# add files necessary to install all dependencies
 ADD Makefile setup.py requirements.txt pyproject.toml ./
-ADD localstack/ localstack/
-ADD bin/localstack bin/localstack
-# necessary for running pip install -e
-ADD bin/localstack.bat bin/localstack.bat
+# add the localstack start scripts (necessary for the installation of the runtime dependencies, i.e. `pip install -e .`)
+ADD bin/localstack bin/localstack.bat bin/
 
 # install dependencies to run the localstack runtime and save which ones were installed
 RUN make install-runtime
 RUN make freeze > requirements-runtime.txt
 
-# initialize installation (downloads remaining dependencies)
-ADD localstack/infra/stepfunctions localstack/infra/stepfunctions
-RUN make init
+# remove localstack (added as a transitive dependency of localstack-ext)
+RUN (virtualenv .venv && source .venv/bin/activate && pip3 uninstall -y localstack)
 
-# clean up and prepare for squashing the image
-RUN pip uninstall -y awscli boto3 botocore localstack_client idna s3transfer
-RUN rm -rf .venv/lib/python3.*/site-packages/cfnlint
-RUN (virtualenv .venv && source .venv/bin/activate && pip cache purge)
-# RUN rm -rf /tmp/* /root/.cache /opt/yarn-* /root/.npm/*cache
-
-FROM base-${TARGETARCH} as light
-
-# Install runtime dependences to base
-RUN apt-get update && \
-        # Install dependencies to get Docker
-        apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release && \
-        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
-        echo \
-            "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian \
-            $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null && \
-        # Install Runtime Packages
-        apt-get update && \
-        apt-get install -y --no-install-recommends \
-            # Install latest version of Docker-CLI
-            docker-ce-cli \
-            # Required for AWS CLI Help
-            groff-base \
-            iputils-ping \
-            nss-passwords \
-            postgresql \
-            postgresql-client \
-            postgresql-plpython3
-
-# Copy in the build dependences
-COPY --from=builder /opt/code/localstack /opt/code/localstack
-
-RUN mkdir -p /tmp/localstack && \
-    if [ -e /usr/bin/aws ]; then mv /usr/bin/aws /usr/bin/aws.bk; fi; ln -s /opt/code/localstack/.venv/bin/aws /usr/bin/aws
-
-# set up PYTHONPATH (after global pip packages are removed above), accommodating different install paths
-ENV PYTHONPATH=/opt/code/localstack/.venv/lib/python3.9/site-packages:/opt/code/localstack/.venv/lib/python3.8/site-packages:/opt/code/localstack/.venv/lib/python3.7/site-packages
-RUN which awslocal
-
-# fix some permissions and create local user
-RUN mkdir -p /.npm && \
-    chmod 777 . && \
-    chmod 755 /root && \
-    chmod -R 777 /.npm && \
-    chmod -R 777 /tmp/localstack && \
-    useradd -ms /bin/bash localstack && \
-    # chown -R localstack:localstack . /tmp/localstack && \
-    ln -s `pwd` /tmp/localstack_install_dir
+# add the results of `make init` to the container. `make init` _needs_ to be executed before building this docker image.
+ADD localstack/infra/ localstack/infra/
 
 
 
-FROM light as full
+# base-light: Stage which does not add additional dependencies (like elasticsearch)
+FROM base-${TARGETARCH} as base-light
+RUN touch localstack/infra/.light-version
+
+
+
+# base-full: Stage which adds additional dependencies to avoid installing them at runtime (f.e. elasticsearch)
+FROM base-${TARGETARCH} as base-full
 
 # Install Elasticsearch
 # https://github.com/pires/docker-elasticsearch/issues/56
@@ -264,8 +200,9 @@ ENV ES_TMPDIR /tmp
 ENV ES_BASE_DIR=localstack/infra/elasticsearch
 ENV ES_JAVA_HOME /usr/lib/jvm/java-11
 RUN TARGETARCH_SYNONYM=$([[ "$TARGETARCH" == "amd64" ]] && echo "x86_64" || echo "aarch64"); \
+    mkdir -p /opt/code/localstack/localstack/infra && \
     curl -L -o /tmp/localstack.es.tar.gz \
-        https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-7.7.0-linux-${TARGETARCH_SYNONYM}.tar.gz && \
+        https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-7.10.0-linux-${TARGETARCH_SYNONYM}.tar.gz && \
     (cd localstack/infra/ && tar -xf /tmp/localstack.es.tar.gz && \
         mv elasticsearch* elasticsearch && rm /tmp/localstack.es.tar.gz) && \
     (cd $ES_BASE_DIR && \
@@ -283,4 +220,59 @@ RUN TARGETARCH_SYNONYM=$([[ "$TARGETARCH" == "amd64" ]] && echo "x86_64" || echo
         mkdir -p $ES_BASE_DIR/logs && \
         chmod -R 777 $ES_BASE_DIR/config && \
         chmod -R 777 $ES_BASE_DIR/data && \
-        chmod -R 777 $ES_BASE_DIR/logs)
+        chmod -R 777 $ES_BASE_DIR/logs) && \
+    ( rm -rf $ES_BASE_DIR/modules/x-pack-ml/platform && \
+        rm -rf $ES_BASE_DIR/modules/ingest-geoip)
+
+
+
+# light: Stage which produces a final working localstack image (which does not contain some additional infrastructure like eleasticsearch - see "full" stage)
+FROM base-${IMAGE_TYPE}
+
+LABEL authors="LocalStack Contributors"
+LABEL maintainer="LocalStack Team (info@localstack.cloud)"
+LABEL description="LocalStack Docker image"
+
+# Copy in the build dependencies
+COPY --from=builder /opt/code/localstack/ /opt/code/localstack/
+
+RUN mkdir -p /tmp/localstack && \
+    if [ -e /usr/bin/aws ]; then mv /usr/bin/aws /usr/bin/aws.bk; fi; ln -s /opt/code/localstack/.venv/bin/aws /usr/bin/aws
+
+# fix some permissions and create local user
+RUN mkdir -p /.npm && \
+    chmod 777 . && \
+    chmod 755 /root && \
+    chmod -R 777 /.npm && \
+    chmod -R 777 /tmp/localstack && \
+    useradd -ms /bin/bash localstack && \
+    # TODO check if this is necessary or not
+    # chown -R localstack:localstack . /tmp/localstack && \
+    ln -s `pwd` /tmp/localstack_install_dir
+
+# Add the code in the last step
+ADD localstack/ localstack/
+
+# Download some more dependencies (make init needs the LocalStack code)
+# FIXME the init python code should be independent and executed in the builder stage
+RUN make init
+
+# Install the latest version of awslocal globally
+RUN pip3 install --upgrade awscli awscli-local requests
+
+# Install the latest version of localstack-ext and generate the plugin entrypoints
+RUN (virtualenv .venv && source .venv/bin/activate && \
+      pip3 install --upgrade localstack-ext localstack-plugin-loader)
+RUN make entrypoints
+
+# Add the build date and git hash at last (changes everytime)
+ARG LOCALSTACK_BUILD_DATE
+ARG LOCALSTACK_BUILD_GIT_HASH
+ENV LOCALSTACK_BUILD_DATE=${LOCALSTACK_BUILD_DATE}
+ENV LOCALSTACK_BUILD_GIT_HASH=${LOCALSTACK_BUILD_GIT_HASH}
+
+# expose edge service, ElasticSearch & debugpy ports
+EXPOSE 4566 4571 5678
+
+# define command at startup
+ENTRYPOINT ["docker-entrypoint.sh"]

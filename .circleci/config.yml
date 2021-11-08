@@ -109,7 +109,7 @@ jobs:
           root:
             /tmp/workspace
           paths:
-            - repo/target/coverage
+            - repo/target/coverage/
       - store_test_results:
           path: target/reports/
 
@@ -136,7 +136,7 @@ jobs:
           root:
             /tmp/workspace
           paths:
-            - repo/target/coverage
+            - repo/target/coverage/
       - store_test_results:
           path: target/reports/
 
@@ -148,57 +148,42 @@ jobs:
       - attach_workspace:
           at: /tmp/workspace
       - run:
-          name: Initialize build environment
-          command: make init
+          name: Build full docker image
+          command: make docker-build
       - run:
-          name: Build localstack docker image
-          command: make docker-build-linux-amd64
+          name: Output docker image stats
+          command: make docker-image-stats
+      #- run:
+      #    name: Run tests
+      #    command: |
+      #      PYTEST_ARGS='--junitxml=target/reports/test-report-amd64.xml' \
+      #      COVERAGE_FILE='target/coverage/.coverage.amd64' \
+      #      make docker-run-tests
       - run:
-          name: Output the Image Size
-          command: docker image inspect localstack/localstack:latest --format='{{.Size}}'
+          name: Save full docker image
+          command: PLATFORM="amd64" make docker-save-image
+          #command: |
+          #  test "$CIRCLE_BRANCH" = "master" \
+          #    && PLATFORM="amd64" make docker-save-image || true
       - run:
-          name: Output the image layer history
-          command: docker history localstack/localstack:latest
-      # - run:
-      #     name: Run the tests
-      #     command: |
-      #       PYTEST_ARGS='--junitxml=target/reports/test-report-amd64.xml' \
-      #       COVERAGE_FILE='target/coverage/.coverage.amd64' \
-      #       make docker-run-tests
+          name: Build light docker image
+          command: make docker-build-light
+          #command: |
+          #  test "$CIRCLE_BRANCH" = "master" \
+          #    && make docker-build-light || true
       - run:
-          name: Save docker image
-          command: docker save localstack/localstack:latest -o target/localstack-docker-image-amd64.tar
+          name: Save light docker image
+          command: PLATFORM="amd64" make docker-save-image-light
+          #command: |
+          #  test "$CIRCLE_BRANCH" = "master" \
+          #    && PLATFORM="amd64" make docker-save-image-light || true
       - persist_to_workspace:
           root:
             /tmp/workspace
           paths:
-            - repo
+            - repo/target/
       - store_test_results:
           path: target/reports/
-
-  docker-run-tests-amd64:
-    machine:
-      image: ubuntu-2004:202107-02
-    parallelism: 4
-    working_directory: /tmp/workspace/repo
-    steps:
-      - attach_workspace:
-          at: /tmp/workspace
-      - run:
-          name: Load docker image
-          command: docker load -i target/localstack-docker-image-amd64.tar
-      - run:
-          name: Run the tests
-          command: |
-            FILE_LIST=$(circleci tests glob "tests/**/test_*.py" | circleci tests split --split-by=timings --show-counts)
-            export TEST_PATH="${FILE_LIST//$'\n'/ }"
-            export COVERAGE_FILE="target/coverage/.coverage.${CIRCLE_NODE_INDEX}.amd64"
-            export PYTEST_ARGS="-o junit_family=xunit1 --junitxml=target/reports/${CIRCLE_NODE_INDEX}-test-report-amd64.xml"
-            make docker-run-tests
-      - store_test_results:
-          path: target/reports/
-      - store_artifacts:
-          path: target/reports
 
   docker-build-arm64:
     machine:
@@ -226,61 +211,48 @@ jobs:
             sudo apt-get install docker-ce docker-ce-cli containerd.io haveged -y
             sudo usermod -aG docker $USER
       - run:
-          name: Build localstack docker image
-          command: make docker-build-linux-arm64
-      - run:
-          name: Output the Image Size
-          command: docker image inspect localstack/localstack:latest --format='{{.Size}}'
-      - run:
-          name: Output the image layer history
-          command: docker history localstack/localstack:latest
-      - run:
+          # Install the emulation support before starting to build (resets the build cache)
           name: Install amd64 emulation support for lambda tests
           command: |
             docker run --rm --privileged tonistiigi/binfmt:latest --install all
             docker buildx create --name multiarch-builder --use
-      # - run:
-      #     name: Run the tests
-      #     command: |
-      #       PYTEST_ARGS='--junitxml=target/reports/test-report-arm64.xml' \
-      #       COVERAGE_FILE='target/coverage/.coverage.arm64' \
-      #       make docker-run-tests
       - run:
-          name: Save docker image
-          command: docker save localstack/localstack:latest -o target/localstack-docker-image-arm64.tar || true
+          name: Build full docker image
+          command: make docker-build
+      - run:
+          name: Output docker image stats
+          command: make docker-image-stats
+      #- run:
+      #    name: Run tests
+      #    command: |
+      #      PYTEST_ARGS='--junitxml=target/reports/test-report-arm64.xml' \
+      #      COVERAGE_FILE='target/coverage/.coverage.arm64' \
+      #      make docker-run-tests
+      - run:
+          name: Save full docker image
+          command: PLATFORM="arm64" make docker-save-image
+          #command: |
+          #  test "$CIRCLE_BRANCH" = "master" \
+          #    && PLATFORM="arm64" make docker-save-image || true
+      - run:
+          name: Build light docker image
+          command: make docker-build-light
+          #command: |
+          #  test "$CIRCLE_BRANCH" = "master" \
+          #    && make docker-build-light || true
+      - run:
+          name: Save light docker image
+          command: PLATFORM="arm64" make docker-save-image-light
+          #command: |
+          #  test "$CIRCLE_BRANCH" = "master" \
+          #    && PLATFORM="arm64" make docker-save-image-light || true
       - persist_to_workspace:
           root:
             /tmp/workspace
           paths:
-            - repo
+            - repo/target/
       - store_test_results:
           path: target/reports/
-
-  docker-run-tests-arm64:
-    machine:
-      # The latest version of ubuntu is not yet supported for ARM: https://circleci.com/docs/2.0/arm-resources/
-      image: ubuntu-2004:202101-01
-    resource_class: arm.medium
-    parallelism: 1
-    working_directory: /tmp/workspace/repo
-    steps:
-      - attach_workspace:
-          at: /tmp/workspace
-      - run:
-          name: Load docker image
-          command: docker load -i target/localstack-docker-image-arm64.tar
-      - run:
-          name: Run the tests
-          command: |
-            FILE_LIST=$(circleci tests glob "tests/**/test_*.py" | circleci tests split --split-by=timings --show-counts)
-            export TEST_PATH="${FILE_LIST//$'\n'/ }"
-            export COVERAGE_FILE="target/coverage/.coverage.${CIRCLE_NODE_INDEX}.arm64"
-            export PYTEST_ARGS="-o junit_family=xunit1 --junitxml=target/reports/${CIRCLE_NODE_INDEX}-test-report-arm64.xml"
-            make docker-run-tests
-      - store_test_results:
-          path: target/reports/
-      - store_artifacts:
-          path: target/reports
 
   report:
     docker:
@@ -321,11 +293,14 @@ jobs:
           name: Load docker image
           command: docker load -i target/localstack-docker-image-amd64.tar
       - run:
-          name: Run pre-release smoke tests
-          command: make ci-pro-smoke-tests
+          name: Load docker image light
+          command: docker load -i target/localstack-docker-image-light-amd64.tar
+      #- run:
+      #    name: Run pre-release smoke tests
+      #    command: make ci-pro-smoke-tests
       - run:
           name: Push docker image
-          command: make docker-push-master-amd64
+          command: PLATFORM="amd64" make docker-push-master
 
   docker-push-arm64:
     machine:
@@ -339,13 +314,16 @@ jobs:
           name: Load docker image
           command: docker load -i target/localstack-docker-image-arm64.tar
       - run:
-          name: Run pre-release smoke tests
-          command: make ci-pro-smoke-tests
+          name: Load docker image light
+          command: docker load -i target/localstack-docker-image-light-arm64.tar
+      #- run:
+      #    name: Run pre-release smoke tests
+      #    command: make ci-pro-smoke-tests
       - run:
           name: Push docker image
-          command: make docker-push-master-arm64
+          command: PLATFORM="arm64" make docker-push-master
 
-  docker-create-manifests:
+  docker-create-push-manifests:
     machine:
       image: ubuntu-2004:202107-02
     working_directory: /tmp/workspace/repo
@@ -354,8 +332,10 @@ jobs:
           at: /tmp/workspace
       - run:
           name: create multi-platform manifests
-          command: make docker-create-manifests
-
+          command: make docker-create-push-manifests
+      - run:
+          name: create multi-platform manifests light
+          command: make docker-create-push-manifests-light
 
 workflows:
   main:
@@ -373,46 +353,37 @@ workflows:
       - docker-build-amd64:
           requires:
             - preflight
-      - docker-run-tests-amd64:
-          requires:
-            - docker-build-amd64
       - docker-build-arm64:
           requires:
             - preflight
-      - docker-run-tests-arm64:
-          requires:
-            - docker-build-arm64
       - report:
           requires:
             - itest-lambda-docker
             - itest-elasticmq
-            - docker-run-tests-amd64
+            - docker-build-amd64
+            - docker-build-arm64
       - docker-push-amd64:
-          filters:
-            branches:
-              only: master
+          #filters:
+          #  branches:
+          #    only: master
           requires:
             - itest-lambda-docker
             - itest-elasticmq
             - docker-build-amd64
-            - docker-run-tests-amd64
             - docker-build-arm64
-            - docker-run-tests-arm64
       - docker-push-arm64:
-          filters:
-            branches:
-              only: master
+          #filters:
+          #  branches:
+          #    only: master
           requires:
             - itest-lambda-docker
             - itest-elasticmq
             - docker-build-amd64
-            - docker-run-tests-amd64
             - docker-build-arm64
-            - docker-run-tests-arm64
-      - docker-create-manifests:
-          filters:
-            branches:
-              only: master
+      - docker-create-push-manifests:
+          #filters:
+          #  branches:
+          #    only: master
           requires:
             - docker-push-amd64
             - docker-push-arm64
