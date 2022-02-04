@@ -26,6 +26,7 @@ from localstack.utils.common import (
     json_safe,
     replace_response_content,
     short_uid,
+    str_startswith_ignore_case,
     to_bytes,
     to_str,
     truncate,
@@ -109,7 +110,7 @@ def to_xml(data: dict, memberize: bool = True) -> ET.Element:
         elif isinstance(data_rest, str):
             parent_el.text = data_rest
         elif any(
-            [isinstance(data_rest, i) for i in [bool, str, int, float]]
+            isinstance(data_rest, i) for i in [bool, str, int, float]
         ):  # limit types for text serialization
             parent_el.text = str(data_rest)
         else:
@@ -225,6 +226,11 @@ def is_json_request(req_headers: Dict) -> bool:
     return "json" in ctype or "json" in accept
 
 
+def is_invalid_html_response(headers, content) -> bool:
+    content_type = headers.get("Content-Type", "")
+    return "text/html" in content_type and not str_startswith_ignore_case(content, "<!doctype html")
+
+
 def raise_exception_if_error_response(response):
     if not is_response_obj(response):
         return
@@ -260,7 +266,9 @@ def get_response_payload(response, as_json=False):
     return result
 
 
-def requests_response(content, status_code=200, headers={}):
+def requests_response(content, status_code=200, headers=None):
+    if headers is None:
+        headers = {}
     resp = RequestsResponse()
     headers = CaseInsensitiveDict(dict(headers or {}))
     if isinstance(content, dict):
@@ -274,7 +282,9 @@ def requests_response(content, status_code=200, headers={}):
     return resp
 
 
-def request_response_stream(stream, status_code=200, headers={}):
+def request_response_stream(stream, status_code=200, headers=None):
+    if headers is None:
+        headers = {}
     resp = RequestsResponse()
     resp.raw = stream
     resp.status_code = int(status_code)
@@ -352,7 +362,9 @@ def extract_url_encoded_param_list(req_data, pattern):
     return result
 
 
-def parse_urlencoded_data(qs_data, top_level_attribute):
+def parse_urlencoded_data(
+    qs_data: Union[Dict, str, bytes], top_level_attribute: str, second_level_attribute: str = ""
+):
     # TODO: potentially find a better way than calling moto here...
     from moto.core.responses import BaseResponse
 
@@ -364,6 +376,27 @@ def parse_urlencoded_data(qs_data, top_level_attribute):
     response = BaseResponse()
     response.querystring = qs_data
     result = response._get_multi_param(top_level_attribute, skip_result_conversion=True)
+    if second_level_attribute:
+        for r in range(len(result)):
+            second_level_result = response._get_multi_param(
+                f"{top_level_attribute}.{r+1}.{second_level_attribute}", skip_result_conversion=True
+            )
+            inner_key = second_level_attribute.split(".")[
+                0
+            ]  # "MessageAttributes.entry".split('.')[0]
+            if second_level_result:
+                result[r][inner_key] = second_level_result
+    return result
+
+
+def parse_query_string(url_or_qs: str, multi_values=False) -> Dict:
+    url_or_qs = str(url_or_qs or "").strip()
+    if "://" in url_or_qs and "?" not in url_or_qs:
+        url_or_qs = f"{url_or_qs}?"
+    url_or_qs = url_or_qs.split("?", maxsplit=1)[-1]
+    result = parse_qs(url_or_qs, keep_blank_values=True)
+    if not multi_values:
+        result = {k: v[0] for k, v in result.items()}
     return result
 
 

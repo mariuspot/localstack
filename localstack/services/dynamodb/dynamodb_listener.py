@@ -600,21 +600,28 @@ class ProxyListenerDynamoDB(ProxyListener):
             records_to_kinesis = copy.deepcopy(records)
             forward_to_kinesis_stream(records_to_kinesis)
             # forward to lambda and ddb_streams
-            forward_to_lambda(records)
             records = self.prepare_records_to_forward_to_ddb_stream(records)
             forward_to_ddb_stream(records)
+            forward_to_lambda(records)  # lambda receives the same records as the ddb streams
 
     # -------------
     # UTIL METHODS
     # -------------
 
-    def prepare_request_headers(self, headers):
+    @classmethod
+    def prepare_request_headers(cls, headers):
+        def _replace(regex, replace):
+            headers["Authorization"] = re.sub(
+                regex, replace, headers.get("Authorization") or "", flags=re.IGNORECASE
+            )
+
         # Note: We need to ensure that the same access key is used here for all requests,
         # otherwise DynamoDBLocal stores tables/items in separate namespaces
-        headers["Authorization"] = re.sub(
-            r"Credential=[^/]+/",
-            r"Credential=%s/" % constants.TEST_AWS_ACCESS_KEY_ID,
-            headers.get("Authorization") or "",
+        _replace(r"Credential=[^/]+/", r"Credential=%s/" % constants.INTERNAL_AWS_ACCESS_KEY_ID)
+        # Note: The NoSQL Workbench sends "localhost" or "local" as the region name, which we need to fix here
+        _replace(
+            r"Credential=([^/]+/[^/]+)/local(host)?/",
+            rf"Credential=\1/{aws_stack.get_local_region()}/",
         )
 
     def prepare_batch_write_item_records(self, record, data):
@@ -754,6 +761,11 @@ class ProxyListenerDynamoDB(ProxyListener):
         # When an item in the table is inserted, updated or deleted
         for record in records:
             if record["dynamodb"].get("StreamViewType"):
+                if "SequenceNumber" not in record["dynamodb"]:
+                    record["dynamodb"]["SequenceNumber"] = str(
+                        dynamodbstreams_api.DynamoDBStreamsBackend.SEQUENCE_NUMBER_COUNTER
+                    )
+                    dynamodbstreams_api.DynamoDBStreamsBackend.SEQUENCE_NUMBER_COUNTER += 1
                 # KEYS_ONLY  - Only the key attributes of the modified item are written to the stream
                 if record["dynamodb"]["StreamViewType"] == "KEYS_ONLY":
                     record["dynamodb"].pop("OldImage", None)
@@ -787,8 +799,9 @@ class ProxyListenerDynamoDB(ProxyListener):
 
 
 def get_sse_kms_managed_key():
-    if MANAGED_KMS_KEYS.get(aws_stack.get_region()):
-        return MANAGED_KMS_KEYS[aws_stack.get_region()]
+    existing_key = MANAGED_KMS_KEYS.get(aws_stack.get_region())
+    if existing_key:
+        return existing_key
     kms_client = aws_stack.connect_to_service("kms")
     key_data = kms_client.create_key(Description="Default key that protects DynamoDB data")
     key_id = key_data["KeyMetadata"]["KeyId"]
@@ -818,7 +831,7 @@ def get_sse_description(data):
 def handle_special_request(method, path, data, headers):
     if path.startswith("/shell") or method == "GET":
         if path == "/shell":
-            headers = {"Refresh": "0; url=%s/shell/" % config.TEST_DYNAMODB_URL}
+            headers = {"Refresh": "0; url=%s/shell/" % config.service_url("dynamodb")}
             return aws_responses.requests_response("", headers=headers)
         return True
 
@@ -901,7 +914,9 @@ def is_index_query_valid(table_name, index_query_type):
     return True
 
 
-def has_event_sources_or_streams_enabled(table_name, cache={}):
+def has_event_sources_or_streams_enabled(table_name, cache=None):
+    if cache is None:
+        cache = {}
     if not table_name:
         return
     table_arn = aws_stack.dynamodb_table_arn(table_name)
@@ -914,7 +929,7 @@ def has_event_sources_or_streams_enabled(table_name, cache={}):
         result = True
     if not result and dynamodbstreams_api.get_stream_for_table(table_arn):
         result = True
-    cache[table_arn] = result
+
     # if kinesis streaming destination is enabled
     # get table name from table_arn
     # since batch_wrtie and transact write operations passing table_arn instead of table_name
@@ -923,6 +938,7 @@ def has_event_sources_or_streams_enabled(table_name, cache={}):
     if not result and table_definitions.get(table_name):
         if table_definitions[table_name].get("KinesisDataStreamDestinationStatus") == "ACTIVE":
             result = True
+    cache[table_arn] = result
     return result
 
 
@@ -1074,7 +1090,7 @@ def dynamodb_extract_keys(item, table_name):
     result = {}
     table_definitions = DynamoDBRegion.get().table_definitions
     if table_name not in table_definitions:
-        LOGGER.warning("Unknown table: %s not found in %s" % (table_name, table_definitions))
+        LOGGER.warning("Unknown table: %s not found in %s", table_name, table_definitions)
         return None
 
     for key in table_definitions[table_name]["KeySchema"]:
@@ -1095,8 +1111,10 @@ def dynamodb_get_table_stream_specification(table_name):
         return get_table_schema(table_name)["Table"].get("StreamSpecification")
     except Exception as e:
         LOGGER.info(
-            "Unable to get stream specification for table %s : %s %s"
-            % (table_name, e, traceback.format_exc())
+            "Unable to get stream specification for table %s : %s %s",
+            table_name,
+            e,
+            traceback.format_exc(),
         )
         raise e
 

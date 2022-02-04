@@ -2,8 +2,8 @@
 
 import json
 import os
+import random
 import time
-import unittest
 
 import pytest
 import requests
@@ -43,21 +43,27 @@ THIS_FOLDER = os.path.dirname(os.path.realpath(__file__))
 TEST_LAMBDA_ECHO_FILE = os.path.join(THIS_FOLDER, "lambdas", "lambda_echo.py")
 
 
-class SNSTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.sqs_client = aws_stack.connect_to_service("sqs")
-        cls.sns_client = aws_stack.connect_to_service("sns")
-        cls.topic_arn = cls.sns_client.create_topic(Name=TEST_TOPIC_NAME)["TopicArn"]
-        cls.queue_url = cls.sqs_client.create_queue(QueueName=TEST_QUEUE_NAME)["QueueUrl"]
-        cls.dlq_url = cls.sqs_client.create_queue(QueueName=TEST_QUEUE_DLQ_NAME)["QueueUrl"]
+@pytest.fixture(scope="class")
+def setup(request):
+    request.cls.sqs_client = aws_stack.create_external_boto_client("sqs")
+    request.cls.sns_client = aws_stack.create_external_boto_client("sns")
+    request.cls.topic_arn = request.cls.sns_client.create_topic(Name=TEST_TOPIC_NAME)["TopicArn"]
+    request.cls.queue_url = request.cls.sqs_client.create_queue(QueueName=TEST_QUEUE_NAME)[
+        "QueueUrl"
+    ]
+    request.cls.dlq_url = request.cls.sqs_client.create_queue(QueueName=TEST_QUEUE_DLQ_NAME)[
+        "QueueUrl"
+    ]
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.sqs_client.delete_queue(QueueUrl=cls.queue_url)
-        cls.sqs_client.delete_queue(QueueUrl=cls.dlq_url)
-        cls.sns_client.delete_topic(TopicArn=cls.topic_arn)
+    yield
 
+    request.cls.sqs_client.delete_queue(QueueUrl=request.cls.queue_url)
+    request.cls.sqs_client.delete_queue(QueueUrl=request.cls.dlq_url)
+    request.cls.sns_client.delete_topic(TopicArn=request.cls.topic_arn)
+
+
+@pytest.mark.usefixtures("setup")
+class TestSNS:
     def test_publish_unicode_chars(self):
         # connect an SNS topic to a new SQS queue
         _, queue_arn, queue_url = self._create_queue()
@@ -72,7 +78,7 @@ class SNSTest(unittest.TestCase):
             msg_received = msgs["Messages"][0]
             msg_received = json.loads(to_str(msg_received["Body"]))
             msg_received = msg_received["Message"]
-            self.assertEqual(message, msg_received)
+            assert message == msg_received
 
         retry(check_message, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
 
@@ -94,23 +100,36 @@ class SNSTest(unittest.TestCase):
         self.sns_client.subscribe(TopicArn=self.topic_arn, Protocol="http", Endpoint=queue_arn)
 
         def received():
-            self.assertEqual(records[0][0]["Type"], "SubscriptionConfirmation")
-            self.assertEqual(records[0][1]["x-amz-sns-message-type"], "SubscriptionConfirmation")
+            assert records[0][0]["Type"] == "SubscriptionConfirmation"
+            assert records[0][1]["x-amz-sns-message-type"] == "SubscriptionConfirmation"
 
             token = records[0][0]["Token"]
             subscribe_url = records[0][0]["SubscribeURL"]
 
-            self.assertEqual(
-                subscribe_url,
+            assert subscribe_url == (
                 "%s/?Action=ConfirmSubscription&TopicArn=%s&Token=%s"
-                % (external_service_url("sns"), self.topic_arn, token),
+                % (external_service_url("sns"), self.topic_arn, token)
             )
 
-            self.assertIn("Signature", records[0][0])
-            self.assertIn("SigningCertURL", records[0][0])
+            assert "Signature" in records[0][0]
+            assert "SigningCertURL" in records[0][0]
 
         retry(received, retries=5, sleep=1)
         proxy.stop()
+
+    def test_subscribe_with_invalid_protocol(self):
+        topic_arn = self.sns_client.create_topic(Name=TEST_TOPIC_NAME_2)["TopicArn"]
+
+        with pytest.raises(ClientError) as e:
+            self.sns_client.subscribe(
+                TopicArn=topic_arn, Protocol="test-protocol", Endpoint="localstack@yopmail.com"
+            )
+
+        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert e.value.response["Error"]["Code"] == "InvalidParameter"
+
+        # clean up
+        self.sns_client.delete_topic(TopicArn=topic_arn)
 
     def test_attribute_raw_subscribe(self):
         # create SNS topic and connect it to an SQS queue
@@ -134,7 +153,7 @@ class SNSTest(unittest.TestCase):
         )["Attributes"]
 
         # assert the attributes are well set
-        self.assertTrue(actual_attributes["RawMessageDelivery"])
+        assert actual_attributes["RawMessageDelivery"]
 
         # publish message to SNS, receive it from SQS, assert that messages are equal and that they are Raw
         message = "This is a test message"
@@ -153,11 +172,8 @@ class SNSTest(unittest.TestCase):
             )
             msg_received = msgs["Messages"][0]
 
-            self.assertEqual(message, msg_received["Body"])
-            self.assertEqual(
-                binary_attribute,
-                msg_received["MessageAttributes"]["store"]["BinaryValue"],
-            )
+            assert message == msg_received["Body"]
+            assert binary_attribute == msg_received["MessageAttributes"]["store"]["BinaryValue"]
 
         retry(check_message, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
 
@@ -188,7 +204,7 @@ class SNSTest(unittest.TestCase):
             num_msgs_1 = len(
                 self.sqs_client.receive_message(QueueUrl=queue_url, VisibilityTimeout=0)["Messages"]
             )
-            self.assertEqual(num_msgs_1, num_msgs_0 + 1)
+            assert num_msgs_1 == (num_msgs_0 + 1)
             return num_msgs_1
 
         num_msgs_1 = retry(check_message, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
@@ -205,7 +221,7 @@ class SNSTest(unittest.TestCase):
             num_msgs_2 = len(
                 self.sqs_client.receive_message(QueueUrl=queue_url, VisibilityTimeout=0)["Messages"]
             )
-            self.assertEqual(num_msgs_2, num_msgs_1)
+            assert num_msgs_2 == num_msgs_1
             return num_msgs_2
 
         retry(check_message2, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
@@ -246,7 +262,7 @@ class SNSTest(unittest.TestCase):
             num_msgs_1 = len(
                 self.sqs_client.receive_message(QueueUrl=queue_url, VisibilityTimeout=0)["Messages"]
             )
-            self.assertEqual(num_msgs_1, num_msgs_0 + 1)
+            assert num_msgs_1 == (num_msgs_0 + 1)
             return num_msgs_1
 
         num_msgs_1 = retry(check_message1, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
@@ -263,7 +279,7 @@ class SNSTest(unittest.TestCase):
             num_msgs_2 = len(
                 self.sqs_client.receive_message(QueueUrl=queue_url, VisibilityTimeout=0)["Messages"]
             )
-            self.assertEqual(num_msgs_2, num_msgs_1)
+            assert num_msgs_2 == num_msgs_1
             return num_msgs_2
 
         retry(check_message2, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
@@ -294,7 +310,7 @@ class SNSTest(unittest.TestCase):
                     "Messages", []
                 )
             )
-            self.assertEqual(num_msgs_1, num_msgs_0)
+            assert num_msgs_1 == num_msgs_0
             return num_msgs_1
 
         num_msgs_1 = retry(check_message, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
@@ -313,7 +329,7 @@ class SNSTest(unittest.TestCase):
                     "Messages", []
                 )
             )
-            self.assertEqual(num_msgs_2, num_msgs_1)
+            assert num_msgs_2 == num_msgs_1
             return num_msgs_2
 
         retry(check_message3, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
@@ -321,8 +337,12 @@ class SNSTest(unittest.TestCase):
         # clean up
         self.sqs_client.delete_queue(QueueUrl=queue_url)
 
-    def test_subscribe_sqs_queue(self):
+    @pytest.mark.parametrize("external_sqs_port", [None, 12345])
+    def test_subscribe_sqs_queue(self, monkeypatch, external_sqs_port):
         _, queue_arn, queue_url = self._create_queue()
+
+        if external_sqs_port:
+            monkeypatch.setattr(config, "SQS_PORT_EXTERNAL", external_sqs_port)
 
         # publish message
         subscription = self._publish_sns_message_with_attrs(queue_arn, "sqs")
@@ -332,10 +352,7 @@ class SNSTest(unittest.TestCase):
             messages = self.sqs_client.receive_message(QueueUrl=queue_url, VisibilityTimeout=0)[
                 "Messages"
             ]
-            self.assertEqual(
-                json.loads(messages[0]["Body"])["MessageAttributes"]["attr1"]["Value"],
-                "99.12",
-            )
+            assert json.loads(messages[0]["Body"])["MessageAttributes"]["attr1"]["Value"] == "99.12"
 
         retry(check_message, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
 
@@ -356,7 +373,7 @@ class SNSTest(unittest.TestCase):
 
         # assert that message has been received
         def check_message():
-            self.assertGreater(len(sns_backend.platform_endpoint_messages[platform_arn]), 0)
+            assert len(sns_backend.platform_endpoint_messages[platform_arn]) > 0
 
         retry(check_message, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
 
@@ -387,26 +404,26 @@ class SNSTest(unittest.TestCase):
     def test_unknown_topic_publish(self):
         fake_arn = "arn:aws:sns:us-east-1:123456789012:i_dont_exist"
         message = "This is a test message"
-        try:
+
+        with pytest.raises(ClientError) as e:
             self.sns_client.publish(TopicArn=fake_arn, Message=message)
-            self.fail("This call should not be successful as the topic does not exist")
-        except ClientError as e:
-            self.assertEqual(e.response["Error"]["Code"], "NotFound")
-            self.assertEqual(e.response["Error"]["Message"], "Topic does not exist")
-            self.assertEqual(e.response["ResponseMetadata"]["HTTPStatusCode"], 404)
+
+        assert e.value.response["Error"]["Code"] == "NotFound"
+        assert e.value.response["Error"]["Message"] == "Topic does not exist"
+        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
     def test_publish_sms(self):
         response = self.sns_client.publish(PhoneNumber="+33000000000", Message="This is a SMS")
-        self.assertTrue("MessageId" in response)
-        self.assertEqual(response["ResponseMetadata"]["HTTPStatusCode"], 200)
+        assert "MessageId" in response
+        assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
     def test_publish_target(self):
         response = self.sns_client.publish(
             TargetArn="arn:aws:sns:us-east-1:000000000000:endpoint/APNS/abcdef/0f7d5971-aa8b-4bd5-b585-0826e9f93a66",
             Message="This is a push notification",
         )
-        self.assertTrue("MessageId" in response)
-        self.assertEqual(response["ResponseMetadata"]["HTTPStatusCode"], 200)
+        assert "MessageId" in response
+        assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
     def test_tags(self):
         self.sns_client.tag_resource(
@@ -423,28 +440,28 @@ class SNSTest(unittest.TestCase):
             tag for idx, tag in enumerate(tags["Tags"]) if tag not in tags["Tags"][:idx]
         ]
         # test for duplicate tags
-        self.assertEqual(len(tags["Tags"]), len(distinct_tags))
-        self.assertEqual(len(tags["Tags"]), 2)
-        self.assertEqual(tags["Tags"][0]["Key"], "123")
-        self.assertEqual(tags["Tags"][0]["Value"], "abc")
-        self.assertEqual(tags["Tags"][1]["Key"], "456")
-        self.assertEqual(tags["Tags"][1]["Value"], "def")
+        assert len(tags["Tags"]) == len(distinct_tags)
+        assert len(tags["Tags"]) == 2
+        assert tags["Tags"][0]["Key"] == "123"
+        assert tags["Tags"][0]["Value"] == "abc"
+        assert tags["Tags"][1]["Key"] == "456"
+        assert tags["Tags"][1]["Value"] == "def"
 
         self.sns_client.untag_resource(ResourceArn=self.topic_arn, TagKeys=["123"])
 
         tags = self.sns_client.list_tags_for_resource(ResourceArn=self.topic_arn)
-        self.assertEqual(len(tags["Tags"]), 1)
-        self.assertEqual(tags["Tags"][0]["Key"], "456")
-        self.assertEqual(tags["Tags"][0]["Value"], "def")
+        assert len(tags["Tags"]) == 1
+        assert tags["Tags"][0]["Key"] == "456"
+        assert tags["Tags"][0]["Value"] == "def"
 
         self.sns_client.tag_resource(
             ResourceArn=self.topic_arn, Tags=[{"Key": "456", "Value": "pqr"}]
         )
 
         tags = self.sns_client.list_tags_for_resource(ResourceArn=self.topic_arn)
-        self.assertEqual(len(tags["Tags"]), 1)
-        self.assertEqual(tags["Tags"][0]["Key"], "456")
-        self.assertEqual(tags["Tags"][0]["Value"], "pqr")
+        assert len(tags["Tags"]) == 1
+        assert tags["Tags"][0]["Key"] == "456"
+        assert tags["Tags"][0]["Value"] == "pqr"
 
     def test_topic_subscription(self):
         subscription = self.sns_client.subscribe(
@@ -455,11 +472,11 @@ class SNSTest(unittest.TestCase):
         def check_subscription():
             subscription_arn = subscription["SubscriptionArn"]
             subscription_obj = sns_backend.subscription_status[subscription_arn]
-            self.assertEqual(subscription_obj["Status"], "Not Subscribed")
+            assert subscription_obj["Status"] == "Not Subscribed"
 
             _token = subscription_obj["Token"]
             self.sns_client.confirm_subscription(TopicArn=self.topic_arn, Token=_token)
-            self.assertEqual(subscription_obj["Status"], "Subscribed")
+            assert subscription_obj["Status"] == "Subscribed"
 
         retry(check_subscription, retries=PUBLICATION_RETRIES, sleep=PUBLICATION_TIMEOUT)
 
@@ -491,10 +508,10 @@ class SNSTest(unittest.TestCase):
                 QueueUrl=queue_url, MessageAttributeNames=["All"]
             )
             msg_attrs = result["Messages"][0]["MessageAttributes"]
-            self.assertGreater(len(result["Messages"]), 0)
-            self.assertIn("RequestID", msg_attrs)
-            self.assertIn("ErrorCode", msg_attrs)
-            self.assertIn("ErrorMessage", msg_attrs)
+            assert len(result["Messages"]) > 0
+            assert "RequestID" in msg_attrs
+            assert "ErrorCode" in msg_attrs
+            assert "ErrorMessage" in msg_attrs
 
         retry(receive_dlq, retries=8, sleep=2)
 
@@ -541,10 +558,10 @@ class SNSTest(unittest.TestCase):
             result = self.sqs_client.receive_message(
                 QueueUrl=self.dlq_url, MessageAttributeNames=["All"]
             )
-            self.assertGreater(len(result["Messages"]), 0)
-            self.assertEqual(
-                json.loads(json.loads(result["Messages"][0]["Body"])["Message"][0])["message"],
-                "test_redrive_policy",
+            assert len(result["Messages"]) > 0
+            assert (
+                json.loads(json.loads(result["Messages"][0]["Body"])["Message"][0])["message"]
+                == "test_redrive_policy"
             )
 
         retry(receive_dlq, retries=7, sleep=2.5)
@@ -584,10 +601,10 @@ class SNSTest(unittest.TestCase):
             result = self.sqs_client.receive_message(
                 QueueUrl=self.dlq_url, MessageAttributeNames=["All"]
             )
-            self.assertGreater(len(result["Messages"]), 0)
-            self.assertEqual(
-                json.loads(json.loads(result["Messages"][0]["Body"])["Message"][0])["message"],
-                "test_redrive_policy",
+            assert len(result["Messages"]) > 0
+            assert (
+                json.loads(json.loads(result["Messages"][0]["Body"])["Message"][0])["message"]
+                == "test_redrive_policy"
             )
 
         retry(receive_dlq, retries=10, sleep=2)
@@ -618,10 +635,10 @@ class SNSTest(unittest.TestCase):
             result = self.sqs_client.receive_message(
                 QueueUrl=self.dlq_url, MessageAttributeNames=["All"]
             )
-            self.assertGreater(len(result["Messages"]), 0)
-            self.assertEqual(
-                json.loads(json.loads(result["Messages"][0]["Body"])["Message"][0])["message"],
-                "test_redrive_policy",
+            assert len(result["Messages"]) > 0
+            assert (
+                json.loads(json.loads(result["Messages"][0]["Body"])["Message"][0])["message"]
+                == "test_redrive_policy"
             )
 
         retry(receive_dlq, retries=10, sleep=2)
@@ -633,19 +650,16 @@ class SNSTest(unittest.TestCase):
         rs = self.sns_client.publish(
             TopicArn=topic_arn, Message=json.dumps({"message": "test_publish"})
         )
-        self.assertEqual(rs["ResponseMetadata"]["HTTPStatusCode"], 200)
+        assert rs["ResponseMetadata"]["HTTPStatusCode"] == 200
 
-        try:
-            # Publish with empty subject
+        with pytest.raises(ClientError) as e:
             self.sns_client.publish(
                 TopicArn=topic_arn,
                 Subject="",
                 Message=json.dumps({"message": "test_publish"}),
             )
-            self.fail("This call should not be successful as the subject is empty")
 
-        except ClientError as e:
-            self.assertEqual(e.response["Error"]["Code"], "InvalidParameter")
+        assert e.value.response["Error"]["Code"] == "InvalidParameter"
 
         # clean up
         self.sns_client.delete_topic(TopicArn=topic_arn)
@@ -653,8 +667,9 @@ class SNSTest(unittest.TestCase):
     def test_create_topic_test_arn(self):
         response = self.sns_client.create_topic(Name=TEST_TOPIC_NAME)
         topic_arn_params = response["TopicArn"].split(":")
-        self.assertEqual(topic_arn_params[4], TEST_AWS_ACCOUNT_ID)
-        self.assertEqual(topic_arn_params[5], TEST_TOPIC_NAME)
+        testutil.response_arn_matches_partition(self.sns_client, response["TopicArn"])
+        assert topic_arn_params[4] == TEST_AWS_ACCOUNT_ID
+        assert topic_arn_params[5] == TEST_TOPIC_NAME
 
     def test_publish_message_by_target_arn(self):
         self.unsubscribe_all_from_sns()
@@ -689,7 +704,7 @@ class SNSTest(unittest.TestCase):
         )
 
         message = events[0]["Records"][0]
-        self.assertEqual(message["EventSubscriptionArn"], subscription_arn)
+        assert message["EventSubscriptionArn"] == subscription_arn
 
         self.sns_client.publish(
             TargetArn=topic_arn, Message="test_message_2", Subject="test subject"
@@ -703,15 +718,15 @@ class SNSTest(unittest.TestCase):
             expected_length=2,
         )
         # Lambda invoked 1 more time
-        self.assertEqual(len(events), 2)
+        assert len(events) == 2
 
         for event in events:
             message = event["Records"][0]
-            self.assertEqual(message["EventSubscriptionArn"], subscription_arn)
+            assert message["EventSubscriptionArn"] == subscription_arn
 
         # clean up
         self.sns_client.delete_topic(TopicArn=topic_arn)
-        lambda_client = aws_stack.connect_to_service("lambda")
+        lambda_client = aws_stack.create_external_boto_client("lambda")
         lambda_client.delete_function(FunctionName=func_name)
 
     def test_publish_message_after_subscribe_topic(self):
@@ -728,7 +743,7 @@ class SNSTest(unittest.TestCase):
         rs = self.sns_client.publish(
             TopicArn=topic_arn, Subject="test subject", Message="test_message_1"
         )
-        self.assertEqual(rs["ResponseMetadata"]["HTTPStatusCode"], 200)
+        assert rs["ResponseMetadata"]["HTTPStatusCode"] == 200
 
         self.sns_client.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
 
@@ -738,7 +753,7 @@ class SNSTest(unittest.TestCase):
         rs = self.sns_client.publish(
             TopicArn=topic_arn, Subject=message_subject, Message=message_body
         )
-        self.assertEqual(rs["ResponseMetadata"]["HTTPStatusCode"], 200)
+        assert rs["ResponseMetadata"]["HTTPStatusCode"] == 200
         message_id = rs["MessageId"]
 
         def get_message(q_url):
@@ -746,9 +761,9 @@ class SNSTest(unittest.TestCase):
             return json.loads(resp["Messages"][0]["Body"])
 
         message = retry(get_message, retries=3, sleep=2, q_url=queue_url)
-        self.assertEqual(message["MessageId"], message_id)
-        self.assertEqual(message["Subject"], message_subject)
-        self.assertEqual(message["Message"], message_body)
+        assert message["MessageId"] == message_id
+        assert message["Subject"] == message_subject
+        assert message["Message"] == message_body
 
         # clean up
         self.sns_client.delete_topic(TopicArn=topic_arn)
@@ -758,16 +773,12 @@ class SNSTest(unittest.TestCase):
         topic_name = "test-%s" % short_uid()
         topic_arn = self.sns_client.create_topic(Name=topic_name)["TopicArn"]
 
-        with self.assertRaises(ClientError) as ctx:
+        with pytest.raises(ClientError) as e:
             self.sns_client.create_topic(Name=topic_name, Tags=[{"Key": "456", "Value": "pqr"}])
-            self.fail(
-                "This call should not be successful as the topic already exists with different tags"
-            )
 
-        e = ctx.exception
-        self.assertEqual(e.response["Error"]["Code"], "InvalidParameter")
-        self.assertEqual(e.response["Error"]["Message"], "Topic already exists with different tags")
-        self.assertEqual(e.response["ResponseMetadata"]["HTTPStatusCode"], 400)
+        assert e.value.response["Error"]["Code"] == "InvalidParameter"
+        assert e.value.response["Error"]["Message"] == "Topic already exists with different tags"
+        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
         # clean up
         self.sns_client.delete_topic(TopicArn=topic_arn)
@@ -786,7 +797,7 @@ class SNSTest(unittest.TestCase):
             responses.append(self.sns_client.create_topic(Name=topic_name, **arg))
         # assert TopicArn is returned by all the above create_topic calls
         for i in range(len(responses)):
-            self.assertIn("TopicArn", responses[i])
+            assert "TopicArn" in responses[i]
         # clean up
         self.sns_client.delete_topic(TopicArn=responses[0]["TopicArn"])
 
@@ -812,7 +823,7 @@ class SNSTest(unittest.TestCase):
             )
         # Assert endpointarn is returned in every call create platform call
         for i in range(len(responses)):
-            self.assertIn("EndpointArn", responses[i])
+            assert "EndpointArn" in responses[i]
         endpoint_arn = responses[0]["EndpointArn"]
         # clean up
         self.sns_client.delete_endpoint(EndpointArn=endpoint_arn)
@@ -825,8 +836,8 @@ class SNSTest(unittest.TestCase):
         message = "test message {}".format(short_uid())
         topic_arn = self.sns_client.create_topic(Name=topic_name)["TopicArn"]
 
-        base_url = "{}://{}:{}".format(
-            get_service_protocol(), config.LOCALSTACK_HOSTNAME, config.PORT_SNS
+        base_url = (
+            f"{get_service_protocol()}://{config.LOCALSTACK_HOSTNAME}:{config.service_port('sns')}"
         )
         path = "Action=Publish&Version=2010-03-31&TopicArn={}&Message={}".format(topic_arn, message)
 
@@ -839,15 +850,15 @@ class SNSTest(unittest.TestCase):
             url="{}/?{}".format(base_url, path),
             headers=aws_stack.mock_aws_request_headers("sns"),
         )
-        self.assertEqual(r.status_code, 200)
+        assert r.status_code == 200
 
         def get_notification(q_url):
             resp = self.sqs_client.receive_message(QueueUrl=q_url)
             return json.loads(resp["Messages"][0]["Body"])
 
         notification = retry(get_notification, retries=3, sleep=2, q_url=queue_url)
-        self.assertEqual(notification["TopicArn"], topic_arn)
-        self.assertEqual(notification["Message"], message)
+        assert notification["TopicArn"] == topic_arn
+        assert notification["Message"] == message
 
         # clean up
         self.sns_client.delete_topic(TopicArn=topic_arn)
@@ -879,10 +890,9 @@ class SNSTest(unittest.TestCase):
 
         # fetch subscription information
         subscription_list = self.sns_client.list_subscriptions()
-        self.assertEqual(subscription_list["ResponseMetadata"]["HTTPStatusCode"], 200)
-        self.assertEqual(len(subscription_list["Subscriptions"]), number_of_subscriptions)
-
-        self.assertEqual(number_of_subscriptions, len(records))
+        assert subscription_list["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert len(subscription_list["Subscriptions"]) == number_of_subscriptions
+        assert number_of_subscriptions == len(records)
 
         for proxy in proxies:
             proxy.stop()
@@ -894,18 +904,32 @@ class SNSTest(unittest.TestCase):
         return queue_name, queue_arn, queue_url
 
     def test_publish_sms_endpoint(self):
-        def check_messages():
-            sns_backend = SNSBackend.get()
-            self.assertEqual(len(list_of_contacts), len(sns_backend.sms_messages))
-
-        list_of_contacts = ["+10123456789", "+10000000000", "+19876543210"]
+        list_of_contacts = [
+            "+%d" % random.randint(100000000, 9999999999),
+            "+%d" % random.randint(100000000, 9999999999),
+            "+%d" % random.randint(100000000, 9999999999),
+        ]
         message = "Good news everyone!"
-        # Add SMS Subscribers
+
         for number in list_of_contacts:
             self.sns_client.subscribe(TopicArn=self.topic_arn, Protocol="sms", Endpoint=number)
-        # Publish a message.
+
         self.sns_client.publish(Message=message, TopicArn=self.topic_arn)
-        retry(check_messages, retries=3, sleep=0.5)
+
+        sns_backend = SNSBackend.get()
+
+        def check_messages():
+            sms_messages = sns_backend.sms_messages
+            for contact in list_of_contacts:
+                sms_was_found = False
+                for message in sms_messages:
+                    if message["endpoint"] == contact:
+                        sms_was_found = True
+                        break
+
+                assert sms_was_found
+
+        retry(check_messages, sleep=0.5)
 
     def test_publish_sqs_from_sns(self):
         topic = self.sns_client.create_topic(Name="test_topic3")
@@ -929,10 +953,9 @@ class SNSTest(unittest.TestCase):
             response = self.sqs_client.receive_message(
                 QueueUrl=queue_url, MessageAttributeNames=["All"]
             )
-            self.assertEqual(
-                response["Messages"][0]["MessageAttributes"],
-                {"attr1": {"DataType": "Number", "StringValue": "99.12"}},
-            )
+            assert response["Messages"][0]["MessageAttributes"] == {
+                "attr1": {"DataType": "Number", "StringValue": "99.12"}
+            }
             self.sqs_client.delete_message(
                 QueueUrl=queue_url, ReceiptHandle=response["Messages"][0]["ReceiptHandle"]
             )
@@ -954,16 +977,243 @@ class SNSTest(unittest.TestCase):
             response = self.sqs_client.receive_message(
                 QueueUrl=queue_url, MessageAttributeNames=["All"]
             )
-            self.assertIsNone(response["Messages"][0].get("MessageAttributes"))
-            self.assertIn(
-                "100.12",
-                response["Messages"][0]["Body"],
-            )
+            assert response["Messages"][0].get("MessageAttributes") is None
+            assert "100.12" in response["Messages"][0]["Body"]
+
             self.sqs_client.delete_message(
                 QueueUrl=queue_url, ReceiptHandle=response["Messages"][0]["ReceiptHandle"]
             )
 
         retry(get_message_without_attributes, retries=3, sleep=10, queue_url=queue_url)
+
+    def test_publish_batch_messages_from_sns_to_sqs(self):
+        topic = self.sns_client.create_topic(Name="test_topic3")
+        topic_arn = topic["TopicArn"]
+        test_queue = self.sqs_client.create_queue(QueueName="test_queue3")
+
+        queue_url = test_queue["QueueUrl"]
+        self.sns_client.subscribe(
+            TopicArn=topic_arn,
+            Protocol="sqs",
+            Endpoint=queue_url,
+            Attributes={"RawMessageDelivery": "true"},
+        )
+
+        publish_batch_response = self.sns_client.publish_batch(
+            TopicArn=topic_arn,
+            PublishBatchRequestEntries=[
+                {
+                    "Id": "1",
+                    "Message": "Test Message with two attributes",
+                    "Subject": "Subject",
+                    "MessageAttributes": {
+                        "attr1": {"DataType": "Number", "StringValue": "99.12"},
+                        "attr2": {"DataType": "Number", "StringValue": "109.12"},
+                    },
+                },
+                {
+                    "Id": "2",
+                    "Message": "Test Message with one attribute",
+                    "Subject": "Subject",
+                    "MessageAttributes": {"attr1": {"DataType": "Number", "StringValue": "19.12"}},
+                },
+                {
+                    "Id": "3",
+                    "Message": "Test Message without attribute",
+                    "Subject": "Subject",
+                },
+                {
+                    "Id": "4",
+                    "Message": "Test Message without subject",
+                },
+            ],
+        )
+
+        assert "Successful" in publish_batch_response
+        assert "Failed" in publish_batch_response
+
+        for successful_resp in publish_batch_response["Successful"]:
+            assert "Id" in successful_resp
+            assert "MessageId" in successful_resp
+
+        def get_messages(queue_url):
+            response = self.sqs_client.receive_message(
+                QueueUrl=queue_url, MessageAttributeNames=["All"], MaxNumberOfMessages=10
+            )
+            assert len(response["Messages"]) == 4
+            for message in response["Messages"]:
+                assert "Body" in message
+
+                if message["Body"] == "Test Message with two attributes":
+                    assert len(message["MessageAttributes"]) == 2
+                    assert message["MessageAttributes"]["attr1"] == {
+                        "StringValue": "99.12",
+                        "DataType": "Number",
+                    }
+                    assert message["MessageAttributes"]["attr2"] == {
+                        "StringValue": "109.12",
+                        "DataType": "Number",
+                    }
+
+                elif message["Body"] == "Test Message with one attribute":
+                    assert len(message["MessageAttributes"]) == 1
+                    assert message["MessageAttributes"]["attr1"] == {
+                        "StringValue": "19.12",
+                        "DataType": "Number",
+                    }
+
+                elif message["Body"] == "Test Message without attribute":
+                    assert message.get("MessageAttributes") is None
+
+        retry(get_messages, retries=5, sleep=1, queue_url=queue_url)
+
+    def test_publish_batch_messages_from_fifo_topic_to_fifo_queue(self):
+        topic_name = f"topic-{short_uid()}.fifo"
+        queue_name = f"queue-{short_uid()}.fifo"
+
+        topic_arn = self.sns_client.create_topic(Name=topic_name, Attributes={"FifoTopic": "true"})[
+            "TopicArn"
+        ]
+        queue = self.sqs_client.create_queue(
+            QueueName=queue_name,
+            Attributes={"FifoQueue": "true"},
+        )
+
+        queue_url = queue["QueueUrl"]
+        queue_arn = aws_stack.sqs_queue_arn(queue_name)
+
+        self.sns_client.subscribe(
+            TopicArn=topic_arn,
+            Protocol="sqs",
+            Endpoint=queue_arn,
+            Attributes={"RawMessageDelivery": "true"},
+        )
+
+        publish_batch_response = self.sns_client.publish_batch(
+            TopicArn=topic_arn,
+            PublishBatchRequestEntries=[
+                {
+                    "Id": "1",
+                    "MessageGroupId": "1",
+                    "Message": "Test Message with two attributes",
+                    "Subject": "Subject",
+                    "MessageAttributes": {
+                        "attr1": {"DataType": "Number", "StringValue": "99.12"},
+                        "attr2": {"DataType": "Number", "StringValue": "109.12"},
+                    },
+                },
+                {
+                    "Id": "2",
+                    "MessageGroupId": "1",
+                    "Message": "Test Message with one attribute",
+                    "Subject": "Subject",
+                    "MessageAttributes": {"attr1": {"DataType": "Number", "StringValue": "19.12"}},
+                },
+                {
+                    "Id": "3",
+                    "MessageGroupId": "1",
+                    "Message": "Test Message without attribute",
+                    "Subject": "Subject",
+                },
+            ],
+        )
+
+        assert "Successful" in publish_batch_response
+        assert "Failed" in publish_batch_response
+
+        for successful_resp in publish_batch_response["Successful"]:
+            assert "Id" in successful_resp
+            assert "MessageId" in successful_resp
+
+        def get_messages(queue_url):
+            response = self.sqs_client.receive_message(
+                QueueUrl=queue_url, MessageAttributeNames=["All"], MaxNumberOfMessages=10
+            )
+            assert len(response["Messages"]) == 3
+            for message in response["Messages"]:
+                assert "Body" in message
+
+                if message["Body"] == "Test Message with two attributes":
+                    assert len(message["MessageAttributes"]) == 2
+                    assert message["MessageAttributes"]["attr1"] == {
+                        "StringValue": "99.12",
+                        "DataType": "Number",
+                    }
+                    assert message["MessageAttributes"]["attr2"] == {
+                        "StringValue": "109.12",
+                        "DataType": "Number",
+                    }
+
+                elif message["Body"] == "Test Message with one attribute":
+                    assert len(message["MessageAttributes"]) == 1
+                    assert message["MessageAttributes"]["attr1"] == {
+                        "StringValue": "19.12",
+                        "DataType": "Number",
+                    }
+
+                elif message["Body"] == "Test Message without attribute":
+                    assert message.get("MessageAttributes") is None
+
+        retry(get_messages, retries=5, sleep=1, queue_url=queue_url)
+
+    def test_publish_batch_exceptions(self):
+        topic_name = f"topic-{short_uid()}.fifo"
+        queue_name = f"queue-{short_uid()}.fifo"
+
+        topic_arn = self.sns_client.create_topic(Name=topic_name, Attributes={"FifoTopic": "true"})[
+            "TopicArn"
+        ]
+        queue = self.sqs_client.create_queue(
+            QueueName=queue_name,
+            Attributes={"FifoQueue": "true"},
+        )
+
+        queue_url = queue["QueueUrl"]
+        queue_arn = aws_stack.sqs_queue_arn(queue_name)
+
+        self.sns_client.subscribe(
+            TopicArn=topic_arn,
+            Protocol="sqs",
+            Endpoint=queue_arn,
+            Attributes={"RawMessageDelivery": "true"},
+        )
+
+        with pytest.raises(ClientError) as e:
+            self.sns_client.publish_batch(
+                TopicArn=topic_arn,
+                PublishBatchRequestEntries=[
+                    {
+                        "Id": "1",
+                        "Message": "Test Message with two attributes",
+                    }
+                ],
+            )
+        assert e.value.response["Error"]["Code"] == "InvalidParameter"
+        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+        with pytest.raises(ClientError) as e:
+            self.sns_client.publish_batch(
+                TopicArn=topic_arn,
+                PublishBatchRequestEntries=[
+                    {"Id": f"Id_{i}", "Message": f"message_{i}"} for i in range(11)
+                ],
+            )
+        assert e.value.response["Error"]["Code"] == "TooManyEntriesInBatchRequest"
+        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+        with pytest.raises(ClientError) as e:
+            self.sns_client.publish_batch(
+                TopicArn=topic_arn,
+                PublishBatchRequestEntries=[
+                    {"Id": "1", "Message": f"message_{i}"} for i in range(2)
+                ],
+            )
+        assert e.value.response["Error"]["Code"] == "BatchEntryIdsNotDistinct"
+        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+        # cleanup
+        self.sns_client.delete_topic(TopicArn=topic_arn)
+        self.sqs_client.delete_queue(QueueUrl=queue_url)
 
     def add_xray_header(self, request, **kwargs):
         request.headers[
@@ -993,13 +1243,13 @@ class SNSTest(unittest.TestCase):
             WaitTimeSeconds=2,
         )
 
-        self.assertEqual(len(response["Messages"]), 1)
+        assert len(response["Messages"]) == 1
         message = response["Messages"][0]
-        self.assertTrue("Attributes" in message)
-        self.assertTrue("AWSTraceHeader" in message["Attributes"])
-        self.assertEqual(
-            message["Attributes"]["AWSTraceHeader"],
-            "Root=1-3152b799-8954dae64eda91bc9a23a7e8;Parent=7fa8c0f79203be72;Sampled=1",
+        assert "Attributes" in message
+        assert "AWSTraceHeader" in message["Attributes"]
+        assert (
+            message["Attributes"]["AWSTraceHeader"]
+            == "Root=1-3152b799-8954dae64eda91bc9a23a7e8;Parent=7fa8c0f79203be72;Sampled=1"
         )
 
     def test_create_topic_after_delete_with_new_tags(self):
@@ -1012,7 +1262,7 @@ class SNSTest(unittest.TestCase):
         topic1 = self.sns_client.create_topic(
             Name=topic_name, Tags=[{"Key": "Name", "Value": "abc"}]
         )
-        self.assertEqual(topic["TopicArn"], topic1["TopicArn"])
+        assert topic["TopicArn"] == topic1["TopicArn"]
 
         # cleanup
         self.sns_client.delete_topic(TopicArn=topic1["TopicArn"])
@@ -1035,21 +1285,99 @@ class SNSTest(unittest.TestCase):
             SubscriptionArn=subscription["SubscriptionArn"]
         )
 
-        self.assertEqual(
-            subscription_attributes.get("Attributes").get("SubscriptionArn"),
-            subscription["SubscriptionArn"],
+        assert (
+            subscription_attributes.get("Attributes").get("SubscriptionArn")
+            == subscription["SubscriptionArn"]
         )
 
         self.sns_client.unsubscribe(SubscriptionArn=subscription["SubscriptionArn"])
 
-        with self.assertRaises(ClientError) as ctx:
+        with pytest.raises(ClientError) as e:
             self.sns_client.get_subscription_attributes(
                 SubscriptionArn=subscription["SubscriptionArn"]
             )
 
-        self.assertEqual(ctx.exception.response["Error"]["Code"], "NotFound")
-        self.assertEqual(ctx.exception.response["ResponseMetadata"]["HTTPStatusCode"], 404)
+        assert e.value.response["Error"]["Code"] == "NotFound"
+        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
         # cleanup
         self.sns_client.delete_topic(TopicArn=topic_arn)
         self.sqs_client.delete_queue(QueueUrl=queue_url)
+
+    def test_message_to_fifo_sqs(self):
+        topic_name = "topic-{}.fifo".format(short_uid())
+        queue_name = "queue-%s.fifo" % short_uid()
+
+        topic_arn = self.sns_client.create_topic(Name=topic_name, Attributes={"FifoTopic": "true"})[
+            "TopicArn"
+        ]
+        queue = self.sqs_client.create_queue(
+            QueueName=queue_name,
+            Attributes={"FifoQueue": "true"},
+        )
+
+        queue_url = queue["QueueUrl"]
+        queue_arn = aws_stack.sqs_queue_arn(queue_name)
+
+        self.sns_client.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
+
+        message = "Test"
+        self.sns_client.publish(TopicArn=topic_arn, Message=message, MessageGroupId=short_uid())
+
+        def get_message():
+            received = self.sqs_client.receive_message(QueueUrl=queue_url)["Messages"][0]["Body"]
+            assert json.loads(received)["Message"] == message
+
+        retry(get_message, retries=5, sleep=2)
+
+        # cleanup
+        self.sns_client.delete_topic(TopicArn=topic_arn)
+        self.sqs_client.delete_queue(QueueUrl=queue_url)
+
+    def test_validations_for_fifo(self):
+        topic_name = "topic-{}".format(short_uid())
+        fifo_topic_name = "topic-{}.fifo".format(short_uid())
+        fifo_queue_name = "queue-%s.fifo" % short_uid()
+
+        topic_arn = self.sns_client.create_topic(Name=topic_name)["TopicArn"]
+
+        fifo_topic_arn = self.sns_client.create_topic(
+            Name=fifo_topic_name, Attributes={"FifoTopic": "true"}
+        )["TopicArn"]
+
+        fifo_queue_url = self.sqs_client.create_queue(
+            QueueName=fifo_queue_name, Attributes={"FifoQueue": "true"}
+        )["QueueUrl"]
+
+        fifo_queue_arn = aws_stack.sqs_queue_arn(fifo_queue_name)
+
+        with pytest.raises(ClientError) as e:
+            self.sns_client.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=fifo_queue_arn)
+
+        assert e.match("standard SNS topic")
+
+        with pytest.raises(ClientError) as e:
+            self.sns_client.publish(TopicArn=fifo_topic_arn, Message="test")
+
+        assert e.match("MessageGroupId")
+
+        self.sns_client.delete_topic(TopicArn=topic_arn)
+        self.sns_client.delete_topic(TopicArn=fifo_topic_arn)
+        self.sqs_client.delete_queue(QueueUrl=fifo_queue_url)
+
+
+def test_empty_sns_message(sns_client, sqs_client, sns_topic, sqs_queue):
+    topic_arn = sns_topic["Attributes"]["TopicArn"]
+    queue_arn = sqs_client.get_queue_attributes(QueueUrl=sqs_queue, AttributeNames=["QueueArn"])[
+        "Attributes"
+    ]["QueueArn"]
+    sns_client.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn)
+    with pytest.raises(ClientError) as e:
+        sns_client.publish(Message="", TopicArn=topic_arn)
+    assert e.match("Empty message")
+    assert (
+        sqs_client.get_queue_attributes(
+            QueueUrl=sqs_queue, AttributeNames=["ApproximateNumberOfMessages"]
+        )["Attributes"]["ApproximateNumberOfMessages"]
+        == "0"
+    )

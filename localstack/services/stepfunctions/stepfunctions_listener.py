@@ -7,6 +7,8 @@ from localstack.utils.common import to_str
 
 LOG = logging.getLogger(__name__)
 
+SM_ARN_REGEX = r'(arn:aws:states):([^:]+):([^:]+:(stateMachine|execution)):((([^_]+)_)?([^"]+))'
+
 
 class ProxyListenerStepFunctions(ProxyListener):
     def forward_request(self, method, path, data, headers):

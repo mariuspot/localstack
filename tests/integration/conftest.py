@@ -16,7 +16,8 @@ from localstack.config import is_env_true
 from localstack.constants import ENV_INTERNAL_TEST_RUN
 from localstack.services import infra
 from localstack.utils.common import safe_requests
-from tests.integration.test_elasticsearch import ElasticsearchTest
+from tests.integration.test_es import install_async as es_install_async
+from tests.integration.test_opensearch import install_async as opensearch_install_async
 from tests.integration.test_terraform import TestTerraform
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,12 @@ def pytest_runtestloop(session):
     for item in session.items:
         if item.parent and item.parent.cls:
             test_classes.add(item.parent.cls)
+        # OpenSearch is a pytest, not a unit test class, therefore we check based on the item parent's name
+        # (test_opensearch.py).
+        if "opensearch" in str(item.parent).lower():
+            test_init_functions.add(opensearch_install_async)
+        if "es" in str(item.parent).lower():
+            test_init_functions.add(es_install_async)
 
     # add init functions for certain tests that download/install things
     for test_class in test_classes:
@@ -51,11 +58,6 @@ def pytest_runtestloop(session):
         if TestTerraform is test_class:
             logger.info("will initialize TestTerraform")
             test_init_functions.add(TestTerraform.init_async)
-            continue
-        if ElasticsearchTest is test_class:
-            # FIXME: there are other elasticsearch test classes
-            logger.info("will initialize ElasticsearchTest")
-            test_init_functions.add(ElasticsearchTest.init_async)
             continue
 
     if not session.items:

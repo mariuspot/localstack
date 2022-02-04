@@ -1,16 +1,19 @@
+import gzip
+import json
 import logging
 import unittest
 
 import requests
 
 from localstack import config
-from localstack.constants import LOCALHOST_HOSTNAME
+from localstack.constants import HEADER_ACCEPT_ENCODING, LOCALHOST_HOSTNAME
 from localstack.services.generic_proxy import ProxyListener, start_proxy_server
 from localstack.services.infra import start_proxy_for_service
 from localstack.utils.common import (
     get_free_tcp_port,
     is_port_open,
     poll_condition,
+    to_str,
     wait_for_port_open,
 )
 from localstack.utils.server.proxy_server import start_ssl_proxy
@@ -62,7 +65,7 @@ def test_ssl_proxy_server():
     class MyListener(ProxyListener):
         def forward_request(self, *args, **kwargs):
             invocations.append((args, kwargs))
-            return 200
+            return {"foo": "bar"}
 
     invocations = []
 
@@ -74,18 +77,25 @@ def test_ssl_proxy_server():
 
     # start SSL proxy
     proxy_port = get_free_tcp_port()
-    proxy = start_ssl_proxy(proxy_port, port, asynchronous=True)
+    proxy = start_ssl_proxy(proxy_port, port, asynchronous=True, fix_encoding=True)
     wait_for_port_open(proxy_port)
 
     # invoke SSL proxy server
     url = f"https://{LOCALHOST_HOSTNAME}:{proxy_port}"
     num_requests = 3
     for i in range(num_requests):
-        response = requests.get(url)
+        response = requests.get(url, verify=False)
         assert response.status_code == 200
 
     # assert backend server has been invoked
     assert len(invocations) == num_requests
+
+    # invoke SSL proxy server with gzip response
+    for encoding in ["gzip", "gzip, deflate"]:
+        headers = {HEADER_ACCEPT_ENCODING: encoding}
+        response = requests.get(url, headers=headers, verify=False, stream=True)
+        result = response.raw.read()
+        assert to_str(gzip.decompress(result)) == json.dumps({"foo": "bar"})
 
     # clean up
     proxy.stop()

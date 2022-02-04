@@ -1,4 +1,5 @@
 import copy
+import re
 from datetime import datetime
 
 import pytest
@@ -8,6 +9,7 @@ from dateutil.tz import tzutc
 from localstack.aws.api import CommonServiceException, ServiceException
 from localstack.aws.protocol.serializer import create_serializer
 from localstack.aws.spec import load_service
+from localstack.utils.common import to_str
 
 
 def _botocore_serializer_integration_test(
@@ -23,7 +25,7 @@ def _botocore_serializer_integration_test(
     - Load the given service (f.e. "sqs")
     - Serialize the response with the appropriate serializer from the AWS Serivce Framework
     - Parse the serialized response using the botocore parser
-    - Checks the the metadata is correct (status code, requestID,...)
+    - Checks if the metadata is correct (status code, requestID,...)
     - Checks if the parsed response content is equal to the input to the serializer
 
     :param service: to load the correct service specification, serializer, and parser
@@ -47,7 +49,8 @@ def _botocore_serializer_integration_test(
     # Use the parser from botocore to parse the serialized response
     response_parser = create_parser(service.protocol)
     parsed_response = response_parser.parse(
-        serialized_response, service.operation_model(action).output_shape
+        serialized_response.to_readonly_response_dict(),
+        service.operation_model(action).output_shape,
     )
 
     # Check if the result is equal to the initial response params
@@ -101,7 +104,8 @@ def _botocore_error_serializer_integration_test(
     # Use the parser from botocore to parse the serialized response
     response_parser: ResponseParser = create_parser(service.protocol)
     parsed_response = response_parser.parse(
-        serialized_response, service.operation_model(action).output_shape
+        serialized_response.to_readonly_response_dict(),
+        service.operation_model(action).output_shape,
     )
 
     # Check if the result is equal to the initial response params
@@ -128,8 +132,10 @@ def test_rest_xml_serializer_cloudfront_with_botocore():
                 "FunctionMetadata": {
                     "FunctionARN": "string",
                     "Stage": "LIVE",
-                    "CreatedTime": datetime(2015, 1, 1, tzinfo=tzutc()),
-                    "LastModifiedTime": datetime(2015, 1, 1, tzinfo=tzutc()),
+                    # Test the timestamp precision by adding hours, minutes, seconds and some milliseconds
+                    # (as microseconds).
+                    "CreatedTime": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
+                    "LastModifiedTime": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
                 },
             },
             "ComputeUtilization": "string",
@@ -198,7 +204,7 @@ def test_rest_xml_serializer_s3_2_with_botocore():
         "AcceptRanges": "string",
         "Expiration": "string",
         "Restore": "string",
-        "LastModified": datetime(2015, 1, 1),
+        "LastModified": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
         "ContentLength": 123,
         "ETag": "string",
         "MissingMeta": 123,
@@ -209,7 +215,7 @@ def test_rest_xml_serializer_s3_2_with_botocore():
         "ContentLanguage": "string",
         "ContentRange": "string",
         "ContentType": "string",
-        "Expires": datetime(2015, 1, 1),
+        "Expires": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
         "WebsiteRedirectLocation": "string",
         "ServerSideEncryption": "AES256",
         "Metadata": {"string": "string"},
@@ -223,7 +229,7 @@ def test_rest_xml_serializer_s3_2_with_botocore():
         "PartsCount": 123,
         "TagCount": 123,
         "ObjectLockMode": "GOVERNANCE",
-        "ObjectLockRetainUntilDate": datetime(2015, 1, 1),
+        "ObjectLockRetainUntilDate": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
         "ObjectLockLegalHoldStatus": "ON",
     }
     _botocore_serializer_integration_test("s3", "GetObject", parameters)
@@ -253,7 +259,7 @@ def test_query_serializer_cloudformation_with_botocore():
                 },
             ],
             "StackResourceDriftStatus": "MODIFIED",
-            "Timestamp": datetime(2015, 1, 1, tzinfo=tzutc()),
+            "Timestamp": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
         }
     }
     _botocore_serializer_integration_test("cloudformation", "DetectStackResourceDrift", parameters)
@@ -266,12 +272,16 @@ def test_query_serializer_redshift_with_botocore():
             {
                 "ClusterIdentifier": "string",
                 "CurrentDatabaseRevision": "string",
-                "DatabaseRevisionReleaseDate": datetime(2015, 1, 1, tzinfo=tzutc()),
+                "DatabaseRevisionReleaseDate": datetime(
+                    2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()
+                ),
                 "RevisionTargets": [
                     {
                         "DatabaseRevision": "string",
                         "Description": "string",
-                        "DatabaseRevisionReleaseDate": datetime(2015, 1, 1, tzinfo=tzutc()),
+                        "DatabaseRevisionReleaseDate": datetime(
+                            2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()
+                        ),
                     },
                 ],
             },
@@ -346,6 +356,55 @@ def test_query_protocol_error_serialization():
     _botocore_error_serializer_integration_test(
         "sqs", "SendMessage", exception, "InvalidMessageContents", 400, "Exception message!"
     )
+
+
+def test_query_protocol_error_serialization_plain():
+    # Specific error of the ChangeMessageVisibility operation in SQS as the scaffold would generate it
+    class ReceiptHandleIsInvalid(ServiceException):
+        pass
+
+    exception = ReceiptHandleIsInvalid(
+        'The input receipt handle "garbage" is not a valid receipt handle.'
+    )
+
+    # Load the SQS service
+    service = load_service("sqs")
+
+    # Use our serializer to serialize the response
+    response_serializer = create_serializer(service)
+    serialized_response = response_serializer.serialize_error_to_response(
+        exception, service.operation_model("ChangeMessageVisibility")
+    )
+    serialized_response_dict = serialized_response.to_readonly_response_dict()
+    # Replace the random request ID with a static value for comparison
+    serialized_response_body = re.sub(
+        "<RequestId>.*</RequestId>",
+        "<RequestId>static_request_id</RequestId>",
+        to_str(serialized_response_dict["body"]),
+    )
+
+    # This expected_response_body differs from the actual response in the following ways:
+    # - The original response does not define an encoding.
+    # - There is no newline after the XML declaration.
+    # - The response does not contain a Type nor Detail tag (since they aren't contained in the spec).
+    # - The original response uses double quotes for the xml declaration.
+    # Most of these differences should be handled equally by parsing clients, however, we might adopt some of these
+    # changes in the future.
+    expected_response_body = (
+        "<?xml version='1.0' encoding='utf-8'?>\n"
+        '<ErrorResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">'
+        "<Error>"
+        "<Code>ReceiptHandleIsInvalid</Code>"
+        "<Message>The input receipt handle &quot;garbage&quot; is not a valid receipt handle."
+        "</Message>"
+        "</Error>"
+        "<RequestId>static_request_id</RequestId>"
+        "</ErrorResponse>"
+    )
+
+    assert serialized_response_body == expected_response_body
+    assert serialized_response_dict["headers"].get("Content-Type") is not None
+    assert serialized_response_dict["headers"]["Content-Type"] == "text/xml"
 
 
 def test_query_protocol_custom_error_serialization():
@@ -448,8 +507,8 @@ def test_json_serializer_cognito_with_botocore():
                 "KMSKeyID": "string",
             },
             "Status": "Enabled",
-            "LastModifiedDate": datetime(2015, 1, 1, tzinfo=tzutc()),
-            "CreationDate": datetime(2015, 1, 1, tzinfo=tzutc()),
+            "LastModifiedDate": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
+            "CreationDate": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
             "SchemaAttributes": [
                 {
                     "Name": "string",
@@ -572,8 +631,8 @@ def test_restjson_serializer_xray_with_botocore():
                 "Version": 123,
                 "Attributes": {"string": "string"},
             },
-            "CreatedAt": datetime(2015, 1, 1, tzinfo=tzutc()),
-            "ModifiedAt": datetime(2015, 1, 1, tzinfo=tzutc()),
+            "CreatedAt": datetime(2015, 1, 1, 23, 59, 59, 6000, tzinfo=tzutc()),
+            "ModifiedAt": datetime(2015, 1, 1, 23, 59, 59, 1000, tzinfo=tzutc()),
         }
     }
 

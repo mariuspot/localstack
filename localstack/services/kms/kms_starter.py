@@ -10,7 +10,7 @@ from localstack.services.infra import (
     start_proxy_for_service,
 )
 from localstack.services.install import INSTALL_PATH_KMS_BINARY_PATTERN
-from localstack.utils.common import get_arch, get_free_tcp_port, wait_for_port_open
+from localstack.utils.common import get_arch, get_free_tcp_port, platform, wait_for_port_open
 
 LOG = logging.getLogger(__name__)
 
@@ -19,9 +19,11 @@ KMS_PROVIDER = (os.environ.get("KMS_PROVIDER") or "").strip() or "moto"
 
 
 def start_kms_local(port=None, backend_port=None, asynchronous=None, update_listener=None):
-    port = port or config.PORT_KMS
+    port = port or config.service_port("kms")
     backend_port = get_free_tcp_port()
-    kms_binary = INSTALL_PATH_KMS_BINARY_PATTERN.replace("<arch>", get_arch())
+    kms_binary = INSTALL_PATH_KMS_BINARY_PATTERN.replace(
+        "<arch>", f"{platform.system().lower()}-{get_arch()}"
+    )
     log_startup_message("KMS")
     start_proxy_for_service("kms", port, backend_port, update_listener)
     env_vars = {
@@ -31,15 +33,15 @@ def start_kms_local(port=None, backend_port=None, asynchronous=None, update_list
         "KMS_ACCOUNT_ID": TEST_AWS_ACCOUNT_ID,
         "ACCOUNT_ID": TEST_AWS_ACCOUNT_ID,
     }
-    if config.DATA_DIR:
-        env_vars["KMS_DATA_PATH"] = config.DATA_DIR
+    if config.dirs.data:
+        env_vars["KMS_DATA_PATH"] = config.dirs.data
     result = do_run(kms_binary, asynchronous, env_vars=env_vars)
     wait_for_port_open(backend_port)
     return result
 
 
 def start_kms_moto(port=None, backend_port=None, asynchronous=None, update_listener=None):
-    port = port or config.PORT_KMS
+    port = port or config.service_port("kms")
     return start_moto_server(
         "kms",
         port,

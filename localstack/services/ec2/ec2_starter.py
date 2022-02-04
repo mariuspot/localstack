@@ -3,13 +3,14 @@ import re
 
 import xmltodict
 from moto.ec2 import models as ec2_models
-from moto.ec2.exceptions import InvalidPermissionNotFoundError
+from moto.ec2.models import EC2Backend
 from moto.ec2.responses import security_groups, vpcs
 from moto.ec2.responses.reserved_instances import ReservedInstances
 
 from localstack import config
 from localstack.services.infra import start_moto_server
 from localstack.utils.common import long_uid, short_uid
+from localstack.utils.patch import patch
 
 LOG = logging.getLogger(__name__)
 
@@ -21,30 +22,11 @@ XMLNS_EC2 = "http://ec2.amazonaws.com/doc/2016-11-15/"
 
 
 def patch_ec2():
-    def patch_revoke_security_group_egress(backend):
-        revoke_security_group_egress_orig = backend.revoke_security_group_egress
-
-        def revoke_security_group_egress(*args, **kwargs):
-            try:
-                return revoke_security_group_egress_orig(*args, **kwargs)
-            except InvalidPermissionNotFoundError:
-                # this can happen, as CidrIpv6 is not yet supported by moto
-                if args[4] == []:
-                    return "_ignore_"
-
-        return revoke_security_group_egress
-
-    def patch_delete_nat_gateway(backend):
-        def delete_nat_gateway(nat_gateway_id):
-            gateway = backend.nat_gateways.get(nat_gateway_id)
-            if gateway:
-                gateway.state = "deleted"
-
-        return delete_nat_gateway
-
-    for region, backend in ec2_models.ec2_backends.items():
-        backend.revoke_security_group_egress = patch_revoke_security_group_egress(backend)
-        backend.delete_nat_gateway = patch_delete_nat_gateway(backend)
+    @patch(EC2Backend.delete_nat_gateway)
+    def delete_nat_gateway(fn, *args, **kwargs):
+        gateway = fn(*args, **kwargs)
+        if gateway:
+            gateway.state = "deleted"
 
     # TODO Implement Reserved Instance backend
     # https://github.com/localstack/localstack/issues/2435
@@ -121,7 +103,7 @@ def patch_ec2():
                     )
                 ]
             else:
-                LOG.debug('Unsupported VPC endpoint service filter "%s"' % filter["Name"])
+                LOG.debug('Unsupported VPC endpoint service filter "%s"', filter["Name"])
         service_names = [s["serviceName"] for s in services]
         services = [{**s, "serviceType": {"item": s["serviceType"]}} for s in services]
         services = [{**s, "availabilityZones": {"item": s["availabilityZones"]}} for s in services]
@@ -159,7 +141,7 @@ def patch_ec2():
             if filter["Name"] == "prefix-list-name":
                 entries = [s for s in entries if s["prefixListName"] in filter["Values"]]
             else:
-                LOG.debug('Unsupported VPC endpoint service filter "%s"' % filter["Name"])
+                LOG.debug('Unsupported VPC endpoint service filter "%s"', filter["Name"])
         result = {
             "DescribePrefixListsResponse": {
                 "@xmlns": XMLNS_EC2,
@@ -179,8 +161,8 @@ def patch_ec2():
         search_filters = self._get_multi_param("Filter")
         for filter in search_filters:
             filter["Values"] = []
-            for i in range(1, 100):
-                val = filter.get("Value.%s" % i)
+            values = filter["Value"]
+            for val in values:
                 if val is None:
                     break
                 filter["Values"].append(val)
@@ -253,7 +235,7 @@ def patch_ec2():
         result = xmltodict.unparse(result)
         return result
 
-    if not hasattr(vpcs.VPCs, "delete_vpc_endpoints"):
+    if not hasattr(vpcs.VPCs, "create_vpc_endpoint_service_configuration"):
         vpcs.VPCs.create_vpc_endpoint_service_configuration = (
             create_vpc_endpoint_service_configuration
         )
@@ -271,7 +253,7 @@ def patch_ec2():
 
 def start_ec2(port=None, asynchronous=False, update_listener=None):
     patch_ec2()
-    port = port or config.PORT_EC2
+    port = port or config.service_port("ec2")
 
     return start_moto_server(
         "ec2",

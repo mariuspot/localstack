@@ -10,10 +10,12 @@ from typing import Dict, List, Union
 
 import boto3
 from localstack_client.config import get_service_port
-from moto import core as moto_core
+from moto.core import BaseModel
+from moto.core.models import InstanceTrackerMeta
 
 from localstack import config, constants
 from localstack.constants import ENV_DEV, LOCALSTACK_INFRA_PROCESS, LOCALSTACK_VENV_FOLDER
+from localstack.runtime import hooks
 from localstack.services import generic_proxy, install, motoserver
 from localstack.services.generic_proxy import ProxyListener, start_proxy_server
 from localstack.services.plugins import SERVICE_PLUGINS, ServiceDisabled, wait_for_infra_shutdown
@@ -24,7 +26,6 @@ from localstack.utils.bootstrap import (
     canonicalize_api_names,
     get_main_container_id,
     in_ci,
-    load_plugins,
     log_duration,
     setup_logging,
 )
@@ -40,6 +41,7 @@ from localstack.utils.common import (
     run,
     start_thread,
 )
+from localstack.utils.patch import patch
 from localstack.utils.run import FuncThread
 from localstack.utils.server import multiserver
 from localstack.utils.testutil import is_local_test_mode
@@ -48,7 +50,7 @@ from localstack.utils.testutil import is_local_test_mode
 SIGNAL_HANDLERS_SETUP = False
 
 # output string that indicates that the stack is ready
-READY_MARKER_OUTPUT = "Ready."
+READY_MARKER_OUTPUT = constants.READY_MARKER_OUTPUT
 
 # default backend host address
 DEFAULT_BACKEND_HOST = "127.0.0.1"
@@ -99,24 +101,26 @@ def patch_urllib3_connection_pool(**constructor_kwargs):
 
 
 def patch_instance_tracker_meta():
-    """
-    Avoid instance collection for moto dashboard
-    """
+    """Avoid instance collection for moto dashboard"""
 
-    def new_intance(meta, name, bases, dct):
-        cls = super(moto_core.models.InstanceTrackerMeta, meta).__new__(meta, name, bases, dct)
+    if hasattr(InstanceTrackerMeta, "_ls_patch_applied"):
+        return  # ensure we're not applying the patch multiple times
+
+    @patch(InstanceTrackerMeta.__new__, pass_target=False)
+    def new_instance(meta, name, bases, dct):
+        cls = super(InstanceTrackerMeta, meta).__new__(meta, name, bases, dct)
         if name == "BaseModel":
             return cls
         cls.instances = []
         return cls
 
-    moto_core.models.InstanceTrackerMeta.__new__ = new_intance
-
+    @patch(BaseModel.__new__, pass_target=False)
     def new_basemodel(cls, *args, **kwargs):
-        instance = super(moto_core.models.BaseModel, cls).__new__(cls)
+        # skip cls.instances.append(..) which is done by the original/upstream constructor
+        instance = super(BaseModel, cls).__new__(cls)
         return instance
 
-    moto_core.models.BaseModel.__new__ = new_basemodel
+    InstanceTrackerMeta._ls_patch_applied = True
 
 
 def get_multiserver_or_free_service_port():
@@ -146,7 +150,7 @@ def do_run(
     cmd: Union[str, List],
     asynchronous: bool,
     print_output: bool = None,
-    env_vars: Dict[str, str] = {},
+    env_vars: Dict[str, str] = None,
     auto_restart=False,
     strip_color: bool = False,
 ):
@@ -178,8 +182,10 @@ class MotoServerProperties:
 
 
 def start_proxy_for_service(
-    service_name, port, backend_port, update_listener, quiet=False, params={}
+    service_name, port, backend_port, update_listener, quiet=False, params=None
 ):
+    if params is None:
+        params = {}
     # TODO: remove special switch for Elasticsearch (see also note in service_port(...) in config.py)
     if config.FORWARD_EDGE_INMEM and service_name != "elasticsearch":
         if backend_port:
@@ -201,8 +207,16 @@ def start_proxy_for_service(
     )
 
 
-def start_proxy(port, backend_url=None, update_listener=None, quiet=False, params={}, use_ssl=None):
+def start_proxy(
+    port: int,
+    backend_url: str = None,
+    update_listener=None,
+    quiet: bool = False,
+    params: Dict = None,
+    use_ssl: bool = None,
+):
     use_ssl = config.USE_SSL if use_ssl is None else use_ssl
+    params = {} if params is None else params
     proxy_thread = start_proxy_server(
         port=port,
         forward_url=backend_url,
@@ -210,6 +224,7 @@ def start_proxy(port, backend_url=None, update_listener=None, quiet=False, param
         update_listener=update_listener,
         quiet=quiet,
         params=params,
+        check_port=False,
     )
     return proxy_thread
 
@@ -378,11 +393,7 @@ def start_infra(asynchronous=False, apis=None):
                 % config.LAMBDA_EXECUTOR
             )
 
-        if (
-            is_in_docker
-            and not config.LAMBDA_REMOTE_DOCKER
-            and not os.environ.get("HOST_TMP_FOLDER")
-        ):
+        if is_in_docker and not config.LAMBDA_REMOTE_DOCKER and not config.dirs.functions:
             print(
                 "!WARNING! - Looks like you have configured $LAMBDA_REMOTE_DOCKER=0 - "
                 "please make sure to configure $HOST_TMP_FOLDER to point to your host's $TMPDIR"
@@ -394,10 +405,12 @@ def start_infra(asynchronous=False, apis=None):
         patch_urllib3_connection_pool(maxsize=128)
         patch_instance_tracker_meta()
 
-        # load plugins
-        load_plugins()
+        # set up logging
+        setup_logging()
 
-        # with plugins loaded, now start the infrastructure
+        # run hooks, to allow them to apply patches and changes
+        hooks.on_infra_start.run()
+        # with changes that hooks have made, now start the infrastructure
         thread = do_start_infra(asynchronous, apis, is_in_docker)
 
         if not asynchronous and thread:
@@ -419,19 +432,17 @@ def start_infra(asynchronous=False, apis=None):
 
 
 def do_start_infra(asynchronous, apis, is_in_docker):
+
     event_publisher.fire_event(
         event_publisher.EVENT_START_INFRA,
         {"d": is_in_docker and 1 or 0, "c": in_ci() and 1 or 0},
     )
 
-    # set up logging
-    setup_logging()
-
     if config.DEVELOP:
         install.install_debugpy_and_dependencies()
         import debugpy
 
-        LOG.info("Starting debug server at: %s:%s" % (constants.BIND_HOST, config.DEVELOP_PORT))
+        LOG.info("Starting debug server at: %s:%s", constants.BIND_HOST, config.DEVELOP_PORT)
         debugpy.listen((constants.BIND_HOST, config.DEVELOP_PORT))
 
         if config.WAIT_FOR_DEBUGGER:
@@ -461,32 +472,32 @@ def do_start_infra(asynchronous, apis, is_in_docker):
     @log_duration()
     def preload_services():
         """
-        Preload services if EAGER_SERVICE_LOADING is true.
+        Preload services - restore persistence, and initialize services if EAGER_SERVICE_LOADING=1.
         """
-        # TODO: lazy loading should become the default beginning 0.13.0
-        if not config.EAGER_SERVICE_LOADING:
-            # listing the available service plugins will cause resolution of the entry points
-            SERVICE_PLUGINS.list_available()
-            return
 
-        apis = list()
-        for api in SERVICE_PLUGINS.list_available():
-            try:
-                SERVICE_PLUGINS.require(api)
-                apis.append(api)
-            except ServiceDisabled as e:
-                LOG.debug("%s", e)
-            except Exception:
-                LOG.exception("could not load service plugin %s", api)
+        # listing the available service plugins will cause resolution of the entry points
+        available_services = SERVICE_PLUGINS.list_available()
 
         if persistence.is_persistence_enabled():
             if not config.is_env_true(constants.ENV_PRO_ACTIVATED):
                 LOG.warning(
-                    "Persistence mechanism for community services (based on API calls record&replay) will be "
-                    "deprecated in 0.13.0 "
+                    "Persistence mechanism for community services (based on API calls record&replay) "
+                    "will be deprecated in versions 0.13.0 and above"
                 )
 
-            persistence.restore_persisted_data(apis)
+            persistence.restore_persisted_data(available_services)
+
+        # lazy is the default beginning with version 0.13.0
+        if not config.EAGER_SERVICE_LOADING:
+            return
+
+        for api in available_services:
+            try:
+                SERVICE_PLUGINS.require(api)
+            except ServiceDisabled as e:
+                LOG.debug("%s", e)
+            except Exception:
+                LOG.exception("could not load service plugin %s", api)
 
     @log_duration()
     def start_runtime_components():
@@ -501,8 +512,11 @@ def do_start_infra(asynchronous, apis, is_in_docker):
 
         # TODO: properly encapsulate starting/stopping of edge server in a class
         if not poll_condition(
-            lambda: is_port_open(config.get_edge_port_http()), timeout=5, interval=0.1
+            lambda: is_port_open(config.get_edge_port_http()), timeout=15, interval=0.3
         ):
+            if LOG.isEnabledFor(logging.DEBUG):
+                # make another call with quiet=False to print detailed error logs
+                is_port_open(config.get_edge_port_http(), quiet=False)
             raise TimeoutError(
                 f"gave up waiting for edge server on {config.EDGE_BIND_HOST}:{config.EDGE_PORT}"
             )
@@ -514,7 +528,7 @@ def do_start_infra(asynchronous, apis, is_in_docker):
     thread = start_runtime_components()
     preload_services()
 
-    if config.DATA_DIR:
+    if config.dirs.data:
         persistence.save_startup_info()
 
     print(READY_MARKER_OUTPUT)
@@ -522,5 +536,7 @@ def do_start_infra(asynchronous, apis, is_in_docker):
 
     INFRA_READY.set()
     analytics.log.event("infra_ready")
+
+    hooks.on_infra_ready.run()
 
     return thread

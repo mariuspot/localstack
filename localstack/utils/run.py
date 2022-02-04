@@ -1,13 +1,14 @@
 import inspect
 import logging
 import os
+import platform
 import select
 import subprocess
 import sys
 import threading
 import traceback
 from concurrent.futures import Future
-from typing import AnyStr, Dict, List, Optional, Union
+from typing import AnyStr, Callable, Dict, List, Optional, Union
 
 from localstack import config
 
@@ -26,12 +27,13 @@ def run(
     inherit_env=True,
     tty=False,
     shell=True,
+    cwd: str = None,
 ) -> Union[str, subprocess.Popen]:
     LOG.debug("Executing command: %s", cmd)
     env_dict = os.environ.copy() if inherit_env else {}
     if env_vars:
         env_dict.update(env_vars)
-    env_dict = dict([(k, to_str(str(v))) for k, v in env_dict.items()])
+    env_dict = {k: to_str(str(v)) for k, v in env_dict.items()}
 
     if isinstance(cmd, list):
         # See docs of subprocess.Popen(...):
@@ -50,7 +52,8 @@ def run(
         stdin = True
 
     try:
-        cwd = os.getcwd() if inherit_cwd else None
+        if inherit_cwd and not cwd:
+            cwd = os.getcwd()
         if not asynchronous:
             if stdin:
                 return subprocess.check_output(
@@ -110,18 +113,15 @@ def run(
 
 
 def is_mac_os() -> bool:
-    return "Darwin" in get_uname()
+    return "darwin" == platform.system().lower()
 
 
 def is_linux() -> bool:
-    return "Linux" in get_uname()
+    return "linux" == platform.system().lower()
 
 
-def get_uname() -> str:
-    try:
-        return to_str(subprocess.check_output("uname -a", shell=True))
-    except Exception:
-        return ""
+def is_windows() -> bool:
+    return "windows" == platform.system().lower()
 
 
 def to_str(obj: Union[str, bytes], errors="strict"):
@@ -131,7 +131,9 @@ def to_str(obj: Union[str, bytes], errors="strict"):
 class FuncThread(threading.Thread):
     """Helper class to run a Python function in a background thread."""
 
-    def __init__(self, func, params=None, quiet=False):
+    def __init__(
+        self, func, params=None, quiet=False, on_stop: Callable[["FuncThread"], None] = None
+    ):
         threading.Thread.__init__(self)
         self.daemon = True
         self.params = params
@@ -139,6 +141,7 @@ class FuncThread(threading.Thread):
         self.quiet = quiet
         self.result_future = Future()
         self._stop_event = threading.Event()
+        self.on_stop = on_stop
 
     def run(self):
         result = None
@@ -153,8 +156,11 @@ class FuncThread(threading.Thread):
             result = e
             if not self.quiet:
                 LOG.info(
-                    "Thread run method %s(%s) failed: %s %s"
-                    % (self.func, self.params, e, traceback.format_exc())
+                    "Thread run method %s(%s) failed: %s %s",
+                    self.func,
+                    self.params,
+                    e,
+                    traceback.format_exc(),
                 )
         finally:
             try:
@@ -169,3 +175,9 @@ class FuncThread(threading.Thread):
 
     def stop(self, quiet=False):
         self._stop_event.set()
+
+        if self.on_stop:
+            try:
+                self.on_stop(self)
+            except Exception as e:
+                LOG.warning("error while calling on_stop callback: %s", e)

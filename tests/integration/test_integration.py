@@ -11,7 +11,6 @@ import pytest
 
 from localstack.utils import testutil
 from localstack.utils.aws import aws_stack
-from localstack.utils.bootstrap import in_ci
 from localstack.utils.common import (
     clone,
     load_file,
@@ -74,7 +73,7 @@ class IntegrationTest(unittest.TestCase):
 
         # create scheduled Lambda function
         rule_name = "rule-%s" % short_uid()
-        events = aws_stack.connect_to_service("events")
+        events = aws_stack.create_external_boto_client("events")
         events.put_rule(Name=rule_name, ScheduleExpression="rate(1 minutes)")
         events.put_targets(
             Rule=rule_name, Targets=[{"Id": "target-%s" % short_uid(), "Arn": func_arn}]
@@ -86,7 +85,7 @@ class IntegrationTest(unittest.TestCase):
 
     def test_firehose_s3(self):
         s3_resource = aws_stack.connect_to_resource("s3")
-        firehose = aws_stack.connect_to_service("firehose")
+        firehose = aws_stack.create_external_boto_client("firehose")
 
         s3_prefix = "/testdata"
         test_data = '{"test": "firehose_data_%s"}' % short_uid()
@@ -120,9 +119,9 @@ class IntegrationTest(unittest.TestCase):
             self.assertRegex(key, r".*/\d{4}/\d{2}/\d{2}/\d{2}/.*\-\d{4}\-\d{2}\-\d{2}\-\d{2}.*")
 
     def test_firehose_kinesis_to_s3(self):
-        kinesis = aws_stack.connect_to_service("kinesis")
+        kinesis = aws_stack.create_external_boto_client("kinesis")
         s3_resource = aws_stack.connect_to_resource("s3")
-        firehose = aws_stack.connect_to_service("firehose")
+        firehose = aws_stack.create_external_boto_client("firehose")
 
         aws_stack.create_kinesis_stream(TEST_STREAM_NAME, delete=True)
 
@@ -174,11 +173,11 @@ class IntegrationTest(unittest.TestCase):
         lambda_ddb_name = "lambda-ddb-%s" % short_uid()
         queue_name = "queue-%s" % short_uid()
         dynamodb = aws_stack.connect_to_resource("dynamodb")
-        dynamodb_service = aws_stack.connect_to_service("dynamodb")
-        dynamodbstreams = aws_stack.connect_to_service("dynamodbstreams")
-        kinesis = aws_stack.connect_to_service("kinesis")
-        sns = aws_stack.connect_to_service("sns")
-        sqs = aws_stack.connect_to_service("sqs")
+        dynamodb_service = aws_stack.create_external_boto_client("dynamodb")
+        dynamodbstreams = aws_stack.create_external_boto_client("dynamodbstreams")
+        kinesis = aws_stack.create_external_boto_client("kinesis")
+        sns = aws_stack.create_external_boto_client("sns")
+        sqs = aws_stack.create_external_boto_client("sqs")
 
         LOGGER.info("Creating test streams...")
         run_safe(
@@ -265,7 +264,7 @@ class IntegrationTest(unittest.TestCase):
             num_events_ddb - num_put_new_items - num_put_existing_items - num_batch_items
         )
 
-        LOGGER.info("Putting %s items to table..." % num_events_ddb)
+        LOGGER.info("Putting %s items to table...", num_events_ddb)
         table = dynamodb.Table(table_name)
         for i in range(0, num_put_new_items):
             table.put_item(Item={PARTITION_KEY: "testId%s" % i, "data": "foobar123"})
@@ -295,8 +294,7 @@ class IntegrationTest(unittest.TestCase):
         num_events_kinesis = 1
         num_kinesis_records = 10
         LOGGER.info(
-            "Putting %s records in %s event to stream..."
-            % (num_kinesis_records, num_events_kinesis)
+            "Putting %s records in %s event to stream...", num_kinesis_records, num_events_kinesis
         )
         kinesis.put_records(
             Records=[
@@ -387,9 +385,9 @@ class IntegrationTest(unittest.TestCase):
         table_name = TEST_TABLE_NAME + "lsbat" + ddb_lease_table_suffix
         stream_name = TEST_STREAM_NAME
         lambda_ddb_name = "lambda-ddb-%s" % short_uid()
-        dynamodb = aws_stack.connect_to_service("dynamodb", client=True)
-        dynamodb_service = aws_stack.connect_to_service("dynamodb")
-        dynamodbstreams = aws_stack.connect_to_service("dynamodbstreams")
+        dynamodb = aws_stack.create_external_boto_client("dynamodb", client=True)
+        dynamodb_service = aws_stack.create_external_boto_client("dynamodb")
+        dynamodbstreams = aws_stack.create_external_boto_client("dynamodbstreams")
 
         LOGGER.info("Creating test streams...")
         run_safe(
@@ -715,7 +713,7 @@ class IntegrationTest(unittest.TestCase):
         retry(check_invocation, retries=14, sleep=5)
 
 
-@pytest.mark.xfail(in_ci(), reason="This test is notoriously flaky in CI environments")
+@pytest.mark.skip(reason="This test is notoriously flaky in CI environments")  # FIXME
 def test_sqs_batch_lambda_forward(lambda_client, sqs_client, create_lambda_function):
 
     lambda_name_queue_batch = "lambda_queue_batch-%s" % short_uid()
@@ -769,14 +767,12 @@ def test_sqs_batch_lambda_forward(lambda_client, sqs_client, create_lambda_funct
 
         delayed_count = int(attributes.get("ApproximateNumberOfMessagesDelayed"))
         if delayed_count != 0:
-            LOGGER.warning(
-                "SQS delayed message count (actual/expected): %s/%s" % (delayed_count, 0)
-            )
+            LOGGER.warning("SQS delayed message count (actual/expected): %s/%s", delayed_count, 0)
 
         not_visible_count = int(attributes.get("ApproximateNumberOfMessagesNotVisible"))
         if not_visible_count != 0:
             LOGGER.warning(
-                "SQS messages not visible (actual/expected): %s/%s" % (not_visible_count, 0)
+                "SQS messages not visible (actual/expected): %s/%s", not_visible_count, 0
             )
 
         assert 0 == delayed_count, "no messages waiting for retry"
@@ -846,7 +842,7 @@ def test_kinesis_lambda_forward_chain(kinesis_client, s3_client, create_lambda_f
 
 
 def get_event_source_arn(stream_name):
-    kinesis = aws_stack.connect_to_service("kinesis")
+    kinesis = aws_stack.create_external_boto_client("kinesis")
     return kinesis.describe_stream(StreamName=stream_name)["StreamDescription"]["StreamARN"]
 
 
@@ -861,7 +857,7 @@ def get_lambda_invocations_count(
 
 def get_lambda_metrics(func_name, metric=None, period=None, start_time=None, end_time=None):
     metric = metric or "Invocations"
-    cloudwatch = aws_stack.connect_to_service("cloudwatch")
+    cloudwatch = aws_stack.create_external_boto_client("cloudwatch")
     period = period or 600
     end_time = end_time or datetime.now()
     if start_time is None:

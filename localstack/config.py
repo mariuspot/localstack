@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import platform
@@ -7,8 +6,7 @@ import socket
 import subprocess
 import tempfile
 import time
-from os.path import expanduser
-from typing import Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Tuple
 
 import six
 from boto3 import Session
@@ -21,6 +19,7 @@ from localstack.constants import (
     DEFAULT_PORT_EDGE,
     DEFAULT_SERVICE_PORTS,
     FALSE_STRINGS,
+    INSTALL_DIR_INFRA,
     LOCALHOST,
     LOCALHOST_IP,
     LOG_LEVELS,
@@ -30,6 +29,133 @@ from localstack.constants import (
 
 # keep track of start time, for performance debugging
 load_start_time = time.time()
+
+
+class Directories:
+    """
+    Holds the different directories available to localstack. Some directories are shared between the host and the
+    localstack container, some live only on the host and some only in the container.
+
+    Attributes:
+        static_libs: container only; binaries and libraries statically packaged with the image
+        var_libs:    shared; binaries and libraries+data computed at runtime: lazy-loaded binaries, ssl cert, ...
+        cache:       shared; ephemeral data that has to persist across localstack runs and reboots
+        tmp:         shared; ephemeral data that has to persist across localstack runs but not reboots
+        functions:   shared; volume to communicate between host<->lambda containers
+        data:        shared; holds localstack state, pods, ...
+        config:      host only; pre-defined configuration values, cached credentials, machine id, ...
+        init:        shared; user-defined provisioning scripts executed in the container when it starts
+        logs:        shared; log files produced by localstack
+    """
+
+    static_libs: str
+    var_libs: str
+    cache: str
+    tmp: str
+    functions: str
+    data: str
+    config: str
+    init: str
+    logs: str
+
+    # these are the folders mounted into the container by default when the CLI is used
+    default_bind_mounts = ["var_libs", "cache", "tmp", "data", "init", "logs"]
+
+    def __init__(
+        self,
+        static_libs: str = None,
+        var_libs: str = None,
+        cache: str = None,
+        tmp: str = None,
+        functions: str = None,
+        data: str = None,
+        config: str = None,
+        init: str = None,
+        logs: str = None,
+    ) -> None:
+        super().__init__()
+        self.static_libs = static_libs
+        self.var_libs = var_libs
+        self.cache = cache
+        self.tmp = tmp
+        self.functions = functions
+        self.data = data
+        self.config = config
+        self.init = init
+        self.logs = logs
+
+    @staticmethod
+    def from_config():
+        """Returns Localstack directory paths from the config/environment variables defined by the config."""
+        # Note that the entries should be unique, as further downstream in docker_utils.py we're removing
+        # duplicate host paths in the volume mounts via `dict(mount_volumes)`.
+        return Directories(
+            static_libs=INSTALL_DIR_INFRA,
+            var_libs=VAR_LIBS_DIR,
+            cache=CACHE_DIR,
+            tmp=TMP_FOLDER,  # TODO: should inherit from root value for /var/lib/localstack (e.g., MOUNT_ROOT)
+            functions=HOST_TMP_FOLDER,  # TODO: rename variable/consider a volume
+            data=DATA_DIR,
+            config=CONFIG_DIR,
+            init=None,  # TODO: introduce environment variable
+            logs=TMP_FOLDER,  # TODO: add variable
+        )
+
+    @staticmethod
+    def for_container() -> "Directories":
+        """
+        Returns Localstack directory paths as they are defined within the container. Everything shared and writable
+        lives in /var/lib/localstack or /tmp/localstack.
+
+        :returns: Directories object
+        """
+        # only set CONTAINER_VAR_LIBS_FOLDER/CONTAINER_CACHE_FOLDER inside the container to redirect var_libs/cache to
+        # another directory to avoid override by host mount
+        var_libs = (
+            os.environ.get("CONTAINER_VAR_LIBS_FOLDER", "").strip()
+            or "/var/lib/localstack/var_libs"
+        )
+        cache = os.environ.get("CONTAINER_CACHE_FOLDER", "").strip() or "/var/lib/localstack/cache"
+        tmp = (
+            os.environ.get("CONTAINER_TMP_FOLDER", "").strip() or "/tmp/localstack"
+        )  # TODO: discuss movement to /var/lib/localstack/tmp
+        data_dir = os.environ.get("CONTAINER_DATA_DIR_FOLDER", "").strip() or (
+            DATA_DIR if in_docker() else "/tmp/localstack_data"
+        )  # TODO: move to /var/lib/localstack/data
+        return Directories(
+            static_libs=INSTALL_DIR_INFRA,
+            var_libs=var_libs,
+            cache=cache,
+            tmp=tmp,
+            functions=HOST_TMP_FOLDER,  # TODO: move to /var/lib/localstack/tmp
+            data=data_dir,
+            config=None,  # config directory is host-only
+            logs="/var/lib/localstack/logs",
+            init="/docker-entrypoint-initaws.d",
+        )
+
+    def mkdirs(self):
+        for folder in [
+            self.static_libs,
+            self.var_libs,
+            self.cache,
+            self.tmp,
+            self.functions,
+            self.data,
+            self.config,
+            self.init,
+            self.logs,
+        ]:
+            if folder and not os.path.exists(folder):
+                try:
+                    os.makedirs(folder)
+                except Exception:
+                    # this can happen due to a race condition when starting
+                    # multiple processes in parallel. Should be safe to ignore
+                    pass
+
+    def __str__(self):
+        return str(self.__dict__)
 
 
 def eval_log_type(env_var_name):
@@ -48,84 +174,119 @@ def is_env_not_false(env_var_name):
     return os.environ.get(env_var_name, "").lower().strip() not in FALSE_STRINGS
 
 
-# java options to Lambda
-LAMBDA_JAVA_OPTS = os.environ.get("LAMBDA_JAVA_OPTS", "").strip()
+def load_environment(profile: str = None):
+    """Loads the environment variables from ~/.localstack/{profile}.env
+    :param profile: the profile to load (defaults to "default")
+    """
+    if not profile:
+        profile = "default"
 
-# limit in which to kinesalite will start throwing exceptions
-KINESIS_SHARD_LIMIT = os.environ.get("KINESIS_SHARD_LIMIT", "").strip() or "100"
+    path = os.path.join(CONFIG_DIR, f"{profile}.env")
+    if not os.path.exists(path):
+        return
 
-# delay in kinesalite response when making changes to streams
-KINESIS_LATENCY = os.environ.get("KINESIS_LATENCY", "").strip() or "500"
+    import dotenv
 
-# Kinesis provider - either "kinesis-mock" or "kinesalite"
-KINESIS_PROVIDER = os.environ.get("KINESIS_PROVIDER") or "kinesis-mock"
+    dotenv.load_dotenv(path, override=False)
+
+
+def has_docker():
+    try:
+        with open(os.devnull, "w") as devnull:
+            subprocess.check_output("docker ps", stderr=devnull, shell=True)
+        return True
+    except Exception:
+        return False
+
+
+def is_linux():
+    return platform.system() == "Linux"
+
+
+def ping(host):
+    """Returns True if host responds to a ping request"""
+    is_windows = platform.system().lower() == "windows"
+    ping_opts = "-n 1" if is_windows else "-c 1"
+    args = "ping %s %s" % (ping_opts, host)
+    return (
+        subprocess.call(args, shell=not is_windows, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        == 0
+    )
+
+
+def in_docker():
+    """
+    Returns True if running in a docker container, else False
+    Ref. https://docs.docker.com/config/containers/runmetrics/#control-groups
+    """
+    if OVERRIDE_IN_DOCKER:
+        return True
+
+    # details: https://github.com/localstack/localstack/pull/4352
+    if os.path.exists("/.dockerenv"):
+        return True
+    if os.path.exists("/run/.containerenv"):
+        return True
+
+    if not os.path.exists("/proc/1/cgroup"):
+        return False
+    try:
+        if any(
+            [
+                os.path.exists("/sys/fs/cgroup/memory/docker/"),
+                any(
+                    "docker-" in file_names
+                    for file_names in os.listdir("/sys/fs/cgroup/memory/system.slice")
+                ),
+                os.path.exists("/sys/fs/cgroup/docker/"),
+                any(
+                    "docker-" in file_names
+                    for file_names in os.listdir("/sys/fs/cgroup/system.slice/")
+                ),
+            ]
+        ):
+            return False
+    except Exception:
+        pass
+    with open("/proc/1/cgroup", "rt") as ifh:
+        content = ifh.read()
+        if "docker" in content:
+            return True
+        os_hostname = socket.gethostname()
+        if os_hostname and os_hostname in content:
+            return True
+    return False
+
+
+# whether the in_docker check should always return true
+OVERRIDE_IN_DOCKER = is_env_true("OVERRIDE_IN_DOCKER")
+
+is_in_docker = in_docker()
+is_in_linux = is_linux()
+
+# the configuration profile to load
+CONFIG_PROFILE = os.environ.get("CONFIG_PROFILE", "").strip()
+
+# host configuration directory
+CONFIG_DIR = os.environ.get("CONFIG_DIR", os.path.expanduser("~/.localstack"))
+
+# keep this on top to populate environment
+try:
+    load_environment(CONFIG_PROFILE)
+except ImportError:
+    # dotenv may not be available in lambdas or other environments where config is loaded
+    pass
 
 # default AWS region
 if "DEFAULT_REGION" not in os.environ:
     os.environ["DEFAULT_REGION"] = os.environ.get("AWS_DEFAULT_REGION") or AWS_REGION_US_EAST_1
 DEFAULT_REGION = os.environ["DEFAULT_REGION"]
 
-# Whether or not to handle lambda event sources as synchronous invocations
-SYNCHRONOUS_SNS_EVENTS = is_env_true("SYNCHRONOUS_SNS_EVENTS")
-SYNCHRONOUS_SQS_EVENTS = is_env_true("SYNCHRONOUS_SQS_EVENTS")
-SYNCHRONOUS_API_GATEWAY_EVENTS = is_env_not_false("SYNCHRONOUS_API_GATEWAY_EVENTS")
-SYNCHRONOUS_KINESIS_EVENTS = is_env_not_false("SYNCHRONOUS_KINESIS_EVENTS")
-SYNCHRONOUS_DYNAMODB_EVENTS = is_env_not_false("SYNCHRONOUS_DYNAMODB_EVENTS")
-
-# randomly inject faults to Kinesis
-KINESIS_ERROR_PROBABILITY = float(os.environ.get("KINESIS_ERROR_PROBABILITY", "").strip() or 0.0)
-
-# randomly inject faults to DynamoDB
-DYNAMODB_ERROR_PROBABILITY = float(os.environ.get("DYNAMODB_ERROR_PROBABILITY", "").strip() or 0.0)
-DYNAMODB_READ_ERROR_PROBABILITY = float(
-    os.environ.get("DYNAMODB_READ_ERROR_PROBABILITY", "").strip() or 0.0
-)
-DYNAMODB_WRITE_ERROR_PROBABILITY = float(
-    os.environ.get("DYNAMODB_WRITE_ERROR_PROBABILITY", "").strip() or 0.0
-)
-
-# JAVA EE heap size for dynamodb
-DYNAMODB_HEAP_SIZE = os.environ.get("DYNAMODB_HEAP_SIZE", "").strip() or "256m"
-
 # expose services on a specific host externally
 HOSTNAME_EXTERNAL = os.environ.get("HOSTNAME_EXTERNAL", "").strip() or LOCALHOST
 
-# expose SQS on a specific port externally
-SQS_PORT_EXTERNAL = int(os.environ.get("SQS_PORT_EXTERNAL") or 0)
-
 # name of the host under which the LocalStack services are available
 LOCALSTACK_HOSTNAME = os.environ.get("LOCALSTACK_HOSTNAME", "").strip() or LOCALHOST
-
-# host under which the LocalStack services are available from Lambda Docker containers
-HOSTNAME_FROM_LAMBDA = os.environ.get("HOSTNAME_FROM_LAMBDA", "").strip()
-
-# whether to remotely copy the lambda code or locally mount a volume
-LAMBDA_REMOTE_DOCKER = is_env_true("LAMBDA_REMOTE_DOCKER")
-
-# Marker name to indicate that a bucket represents the local file system. This is used for testing
-# Serverless applications where we mount the Lambda code directly into the container from the host OS.
-BUCKET_MARKER_LOCAL = (
-    os.environ.get("BUCKET_MARKER_LOCAL", "").strip() or DEFAULT_BUCKET_MARKER_LOCAL
-)
-
-# network that the docker lambda container will be joining
-LAMBDA_DOCKER_NETWORK = os.environ.get("LAMBDA_DOCKER_NETWORK", "").strip()
-
-# custom DNS server that the docker lambda container will use
-LAMBDA_DOCKER_DNS = os.environ.get("LAMBDA_DOCKER_DNS", "").strip()
-
-# additional flags passed to Lambda Docker run/create commands
-LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "").strip()
-
-# default container registry for lambda execution images
-LAMBDA_CONTAINER_REGISTRY = (
-    os.environ.get("LAMBDA_CONTAINER_REGISTRY", "").strip() or DEFAULT_LAMBDA_CONTAINER_REGISTRY
-)
-
-# whether to remove containers after Lambdas finished executing
-LAMBDA_REMOVE_CONTAINERS = (
-    os.environ.get("LAMBDA_REMOVE_CONTAINERS", "").lower().strip() not in FALSE_STRINGS
-)
 
 # directory for persisting data
 DATA_DIR = os.environ.get("DATA_DIR", "").strip()
@@ -133,22 +294,17 @@ DATA_DIR = os.environ.get("DATA_DIR", "").strip()
 # folder for temporary files and data
 TMP_FOLDER = os.path.join(tempfile.gettempdir(), "localstack")
 
-# create folders
-for folder in [DATA_DIR, TMP_FOLDER]:
-    if folder and not os.path.exists(folder):
-        try:
-            os.makedirs(folder)
-        except Exception:
-            # this can happen due to a race condition when starting
-            # multiple processes in parallel. Should be safe to ignore
-            pass
-
 # fix for Mac OS, to be able to mount /var/folders in Docker
 if TMP_FOLDER.startswith("/var/folders/") and os.path.exists("/private%s" % TMP_FOLDER):
     TMP_FOLDER = "/private%s" % TMP_FOLDER
 
 # temporary folder of the host (required when running in Docker). Fall back to local tmp folder if not set
 HOST_TMP_FOLDER = os.environ.get("HOST_TMP_FOLDER", TMP_FOLDER)
+
+# ephemeral cache dir that persists across reboots
+CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(TMP_FOLDER, "cache")).strip()
+# libs cache dir that persists across reboots
+VAR_LIBS_DIR = os.environ.get("VAR_LIBS_DIR", os.path.join(TMP_FOLDER, "var_libs")).strip()
 
 # whether to enable verbose debug logging
 LS_LOG = eval_log_type("LS_LOG")
@@ -225,13 +381,8 @@ EAGER_SERVICE_LOADING = is_env_true("EAGER_SERVICE_LOADING")
 # Whether to skip downloading additional infrastructure components (e.g., custom Elasticsearch versions)
 SKIP_INFRA_DOWNLOADS = os.environ.get("SKIP_INFRA_DOWNLOADS", "").strip()
 
-# Adding Stepfunctions default port
-LOCAL_PORT_STEPFUNCTIONS = int(os.environ.get("LOCAL_PORT_STEPFUNCTIONS") or 8083)
-# Stepfunctions lambda endpoint override
-STEPFUNCTIONS_LAMBDA_ENDPOINT = os.environ.get("STEPFUNCTIONS_LAMBDA_ENDPOINT", "").strip()
-
-# path prefix for windows volume mounting
-WINDOWS_DOCKER_MOUNT_PREFIX = os.environ.get("WINDOWS_DOCKER_MOUNT_PREFIX", "/host_mnt")
+# whether to enable legacy record&replay persistence mechanism (default true, but will be disabled in a future release!)
+LEGACY_PERSISTENCE = is_env_not_false("LEGACY_PERSISTENCE")
 
 # name of the main Docker container
 MAIN_CONTAINER_NAME = os.environ.get("MAIN_CONTAINER_NAME", "").strip() or "localstack_main"
@@ -242,208 +393,40 @@ LOCALSTACK_BUILD_GIT_HASH = os.environ.get("LOCALSTACK_BUILD_GIT_HASH", "").stri
 # the date on which the docker image was created
 LOCALSTACK_BUILD_DATE = os.environ.get("LOCALSTACK_BUILD_DATE", "").strip() or None
 
-# whether to skip S3 presign URL signature validation (TODO: currently enabled, until all issues are resolved)
-S3_SKIP_SIGNATURE_VALIDATION = is_env_not_false("S3_SKIP_SIGNATURE_VALIDATION")
-
-# whether to skip waiting for the infrastructure to shut down, or exit immediately
-FORCE_SHUTDOWN = is_env_not_false("FORCE_SHUTDOWN")
-
-# whether the in_docker check should always return true
-OVERRIDE_IN_DOCKER = is_env_true("OVERRIDE_IN_DOCKER")
-
-# whether to return mocked success responses for still unimplemented API methods
-MOCK_UNIMPLEMENTED = is_env_true("MOCK_UNIMPLEMENTED")
-
-
-def has_docker():
-    try:
-        with open(os.devnull, "w") as devnull:
-            subprocess.check_output("docker ps", stderr=devnull, shell=True)
-        return True
-    except Exception:
-        return False
-
-
-def is_linux():
-    return platform.system() == "Linux"
-
-
-# whether to use Lambda functions in a Docker container
-LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "").strip()
-if not LAMBDA_EXECUTOR:
-    LAMBDA_EXECUTOR = "docker"
-    if not has_docker():
-        LAMBDA_EXECUTOR = "local"
-
-# Fallback URL to use when a non-existing Lambda is invoked. If this matches
-# `dynamodb://<table_name>`, then the invocation is recorded in the corresponding
-# DynamoDB table. If this matches `http(s)://...`, then the Lambda invocation is
-# forwarded as a POST request to that URL.
-LAMBDA_FALLBACK_URL = os.environ.get("LAMBDA_FALLBACK_URL", "").strip()
-# Forward URL used to forward any Lambda invocations to an external
-# endpoint (can use useful for advanced test setups)
-LAMBDA_FORWARD_URL = os.environ.get("LAMBDA_FORWARD_URL", "").strip()
-# Time in seconds to wait at max while extracting Lambda code.
-# By default it is 25 seconds for limiting the execution time
-# to avoid client/network timeout issues
-LAMBDA_CODE_EXTRACT_TIME = int(os.environ.get("LAMBDA_CODE_EXTRACT_TIME") or 25)
-
-# A comma-delimited string of stream names and its corresponding shard count to
-# initialize during startup.
-# For example: "my-first-stream:1,my-other-stream:2,my-last-stream:1"
-KINESIS_INITIALIZE_STREAMS = os.environ.get("KINESIS_INITIALIZE_STREAMS", "").strip()
-
-# Strategy used when creating elasticsearch domain endpoints routed through the edge proxy
-# valid values: domain | path | off
-ES_ENDPOINT_STRATEGY = os.environ.get("ES_ENDPOINT_STRATEGY", "").strip() or "domain"
-
-# Whether to start one cluster per domain (default), or multiplex domains to a single clusters
-ES_MULTI_CLUSTER = is_env_not_false("ES_MULTI_CLUSTER")
-
 # Equivalent to HTTP_PROXY, but only applicable for external connections
 OUTBOUND_HTTP_PROXY = os.environ.get("OUTBOUND_HTTP_PROXY", "")
 
 # Equivalent to HTTPS_PROXY, but only applicable for external connections
 OUTBOUND_HTTPS_PROXY = os.environ.get("OUTBOUND_HTTPS_PROXY", "")
 
-# list of environment variable names used for configuration.
-# Make sure to keep this in sync with the above!
-# Note: do *not* include DATA_DIR in this list, as it is treated separately
-CONFIG_ENV_VARS = [
-    "SERVICES",
-    "HOSTNAME",
-    "HOSTNAME_EXTERNAL",
-    "LOCALSTACK_HOSTNAME",
-    "LAMBDA_FALLBACK_URL",
-    "LAMBDA_EXECUTOR",
-    "LAMBDA_REMOTE_DOCKER",
-    "LAMBDA_DOCKER_NETWORK",
-    "LAMBDA_REMOVE_CONTAINERS",
-    "USE_SSL",
-    "USE_SINGLE_REGION",
-    "DEBUG",
-    "KINESIS_ERROR_PROBABILITY",
-    "DYNAMODB_ERROR_PROBABILITY",
-    "DYNAMODB_READ_ERROR_PROBABILITY",
-    "DYNAMODB_WRITE_ERROR_PROBABILITY",
-    "ES_ENDPOINT_STRATEGY",
-    "ES_MULTI_CLUSTER",
-    "DOCKER_BRIDGE_IP",
-    "DEFAULT_REGION",
-    "LAMBDA_JAVA_OPTS",
-    "LOCALSTACK_API_KEY",
-    "LAMBDA_CONTAINER_REGISTRY",
-    "TEST_AWS_ACCOUNT_ID",
-    "DISABLE_EVENTS",
-    "EDGE_PORT",
-    "LS_LOG",
-    "EDGE_PORT_HTTP",
-    "EDGE_FORWARD_URL",
-    "SKIP_INFRA_DOWNLOADS",
-    "STEPFUNCTIONS_LAMBDA_ENDPOINT",
-    "WINDOWS_DOCKER_MOUNT_PREFIX",
-    "HOSTNAME_FROM_LAMBDA",
-    "LOG_LICENSE_ISSUES",
-    "SYNCHRONOUS_API_GATEWAY_EVENTS",
-    "SYNCHRONOUS_KINESIS_EVENTS",
-    "BUCKET_MARKER_LOCAL",
-    "SYNCHRONOUS_SNS_EVENTS",
-    "SYNCHRONOUS_SQS_EVENTS",
-    "SYNCHRONOUS_DYNAMODB_EVENTS",
-    "DYNAMODB_HEAP_SIZE",
-    "MAIN_CONTAINER_NAME",
-    "LAMBDA_DOCKER_DNS",
-    "PERSISTENCE_SINGLE_FILE",
-    "S3_SKIP_SIGNATURE_VALIDATION",
-    "DEVELOP",
-    "DEVELOP_PORT",
-    "WAIT_FOR_DEBUGGER",
-    "KINESIS_INITIALIZE_STREAMS",
-    "TF_COMPAT_MODE",
-    "LAMBDA_DOCKER_FLAGS",
-    "LAMBDA_FORWARD_URL",
-    "LAMBDA_CODE_EXTRACT_TIME",
-    "THUNDRA_APIKEY",
-    "THUNDRA_AGENT_JAVA_VERSION",
-    "THUNDRA_AGENT_NODE_VERSION",
-    "THUNDRA_AGENT_PYTHON_VERSION",
-    "DISABLE_CORS_CHECKS",
-    "DISABLE_CUSTOM_CORS_S3",
-    "DISABLE_CUSTOM_CORS_APIGATEWAY",
-    "EXTRA_CORS_ALLOWED_HEADERS",
-    "EXTRA_CORS_EXPOSE_HEADERS",
-    "EXTRA_CORS_ALLOWED_ORIGINS",
-    "ENABLE_CONFIG_UPDATES",
-    "LOCALSTACK_HTTP_PROXY",
-    "LOCALSTACK_HTTPS_PROXY",
-    "REQUESTS_CA_BUNDLE",
-    "LEGACY_DOCKER_CLIENT",
-    "EAGER_SERVICE_LOADING",
-]
+# Whether to enable the partition adjustment listener (in order to support other partitions that the default)
+ARN_PARTITION_REWRITING = is_env_true("ARN_PARTITION_REWRITING")
 
-for key, value in six.iteritems(DEFAULT_SERVICE_PORTS):
-    clean_key = key.upper().replace("-", "_")
-    CONFIG_ENV_VARS += [
-        clean_key + "_BACKEND",
-        clean_key + "_PORT",
-        clean_key + "_PORT_EXTERNAL",
-    ]
+# whether to skip waiting for the infrastructure to shut down, or exit immediately
+FORCE_SHUTDOWN = is_env_not_false("FORCE_SHUTDOWN")
 
+# whether to return mocked success responses for still unimplemented API methods
+MOCK_UNIMPLEMENTED = is_env_true("MOCK_UNIMPLEMENTED")
 
-def ping(host):
-    """Returns True if host responds to a ping request"""
-    is_windows = platform.system().lower() == "windows"
-    ping_opts = "-n 1" if is_windows else "-c 1"
-    args = "ping %s %s" % (ping_opts, host)
-    return (
-        subprocess.call(args, shell=not is_windows, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        == 0
-    )
+# set variables no_proxy, i.e., run internal service calls directly
+no_proxy = ",".join([LOCALSTACK_HOSTNAME, LOCALHOST, LOCALHOST_IP, "[::1]"])
+if os.environ.get("no_proxy"):
+    os.environ["no_proxy"] += "," + no_proxy
+elif os.environ.get("NO_PROXY"):
+    os.environ["NO_PROXY"] += "," + no_proxy
+else:
+    os.environ["no_proxy"] = no_proxy
 
+# additional CLI commands, can be set by plugins
+CLI_COMMANDS = {}
 
-def in_docker():
-    """
-    Returns True if running in a docker container, else False
-    Ref. https://docs.docker.com/config/containers/runmetrics/#control-groups
-    """
-    if OVERRIDE_IN_DOCKER:
-        return True
-    if os.path.exists("/.dockerenv"):
-        return True
-    if not os.path.exists("/proc/1/cgroup"):
-        return False
-    try:
-        if any(
-            [
-                os.path.exists("/sys/fs/cgroup/memory/docker/"),
-                any(
-                    [
-                        "docker-" in file_names
-                        for file_names in os.listdir("/sys/fs/cgroup/memory/system.slice")
-                    ]
-                ),
-                os.path.exists("/sys/fs/cgroup/docker/"),
-                any(
-                    [
-                        "docker-" in file_names
-                        for file_names in os.listdir("/sys/fs/cgroup/system.slice/")
-                    ]
-                ),
-            ]
-        ):
-            return False
-    except Exception:
-        pass
-    with open("/proc/1/cgroup", "rt") as ifh:
-        os_hostname = open("/etc/hostname", "rt").read().strip()
-        content = ifh.read()
-        if os_hostname in content or "docker" in content:
-            return True
-    return False
+# set of valid regions
+VALID_PARTITIONS = set(Session().get_available_partitions())
+VALID_REGIONS = set()
+for partition in VALID_PARTITIONS:
+    for region in Session().get_available_regions("sns", partition):
+        VALID_REGIONS.add(region)
 
-
-is_in_docker = in_docker()
-is_in_linux = is_linux()
 
 # determine IP of Docker bridge
 if not DOCKER_BRIDGE_IP:
@@ -471,33 +454,265 @@ try:
 except socket.error:
     pass
 
+
+# -----
+# SERVICE-SPECIFIC CONFIGS BELOW
+# -----
+
+# port ranges for external service instances (f.e. elasticsearch clusters, opensearch clusters,...)
+EXTERNAL_SERVICE_PORTS_START = int(
+    os.environ.get("EXTERNAL_SERVICE_PORTS_START")
+    or os.environ.get("SERVICE_INSTANCES_PORTS_START")
+    or 4510
+)
+EXTERNAL_SERVICE_PORTS_END = int(
+    os.environ.get("EXTERNAL_SERVICE_PORTS_END")
+    or os.environ.get("SERVICE_INSTANCES_PORTS_END")
+    or (EXTERNAL_SERVICE_PORTS_START + 50)
+)
+
+# java options to Lambda
+LAMBDA_JAVA_OPTS = os.environ.get("LAMBDA_JAVA_OPTS", "").strip()
+
+# limit in which to kinesalite will start throwing exceptions
+KINESIS_SHARD_LIMIT = os.environ.get("KINESIS_SHARD_LIMIT", "").strip() or "100"
+
+# delay in kinesalite response when making changes to streams
+KINESIS_LATENCY = os.environ.get("KINESIS_LATENCY", "").strip() or "500"
+
+# Kinesis provider - either "kinesis-mock" or "kinesalite"
+KINESIS_PROVIDER = os.environ.get("KINESIS_PROVIDER") or "kinesis-mock"
+
+# Whether or not to handle lambda event sources as synchronous invocations
+SYNCHRONOUS_SNS_EVENTS = is_env_true("SYNCHRONOUS_SNS_EVENTS")
+SYNCHRONOUS_SQS_EVENTS = is_env_true("SYNCHRONOUS_SQS_EVENTS")
+SYNCHRONOUS_API_GATEWAY_EVENTS = is_env_not_false("SYNCHRONOUS_API_GATEWAY_EVENTS")
+SYNCHRONOUS_KINESIS_EVENTS = is_env_not_false("SYNCHRONOUS_KINESIS_EVENTS")
+SYNCHRONOUS_DYNAMODB_EVENTS = is_env_not_false("SYNCHRONOUS_DYNAMODB_EVENTS")
+
+# randomly inject faults to Kinesis
+KINESIS_ERROR_PROBABILITY = float(os.environ.get("KINESIS_ERROR_PROBABILITY", "").strip() or 0.0)
+
+# randomly inject faults to DynamoDB
+DYNAMODB_ERROR_PROBABILITY = float(os.environ.get("DYNAMODB_ERROR_PROBABILITY", "").strip() or 0.0)
+DYNAMODB_READ_ERROR_PROBABILITY = float(
+    os.environ.get("DYNAMODB_READ_ERROR_PROBABILITY", "").strip() or 0.0
+)
+DYNAMODB_WRITE_ERROR_PROBABILITY = float(
+    os.environ.get("DYNAMODB_WRITE_ERROR_PROBABILITY", "").strip() or 0.0
+)
+
+# JAVA EE heap size for dynamodb
+DYNAMODB_HEAP_SIZE = os.environ.get("DYNAMODB_HEAP_SIZE", "").strip() or "256m"
+
+# expose SQS on a specific port externally
+SQS_PORT_EXTERNAL = int(os.environ.get("SQS_PORT_EXTERNAL") or 0)
+
+# host under which the LocalStack services are available from Lambda Docker containers
+HOSTNAME_FROM_LAMBDA = os.environ.get("HOSTNAME_FROM_LAMBDA", "").strip()
+
+# whether to remotely copy the Lambda code or locally mount a volume
+LAMBDA_REMOTE_DOCKER = is_env_true("LAMBDA_REMOTE_DOCKER")
 # make sure we default to LAMBDA_REMOTE_DOCKER=true if running in Docker
 if is_in_docker and not os.environ.get("LAMBDA_REMOTE_DOCKER", "").strip():
     LAMBDA_REMOTE_DOCKER = True
 
-# local config file path in home directory
-CONFIG_FILE_PATH = os.path.join(TMP_FOLDER, ".localstack")
-if not is_in_docker:
-    CONFIG_FILE_PATH = os.path.join(expanduser("~"), ".localstack")
+# Marker name to indicate that a bucket represents the local file system. This is used for testing
+# Serverless applications where we mount the Lambda code directly into the container from the host OS.
+BUCKET_MARKER_LOCAL = (
+    os.environ.get("BUCKET_MARKER_LOCAL", "").strip() or DEFAULT_BUCKET_MARKER_LOCAL
+)
 
-# set variables no_proxy, i.e., run internal service calls directly
-no_proxy = ",".join(set((LOCALSTACK_HOSTNAME, LOCALHOST, LOCALHOST_IP, "[::1]")))
-if os.environ.get("no_proxy"):
-    os.environ["no_proxy"] += "," + no_proxy
-elif os.environ.get("NO_PROXY"):
-    os.environ["NO_PROXY"] += "," + no_proxy
-else:
-    os.environ["no_proxy"] = no_proxy
+# network that the docker lambda container will be joining
+LAMBDA_DOCKER_NETWORK = os.environ.get("LAMBDA_DOCKER_NETWORK", "").strip()
 
-# additional CLI commands, can be set by plugins
-CLI_COMMANDS = {}
+# custom DNS server that the docker lambda container will use
+LAMBDA_DOCKER_DNS = os.environ.get("LAMBDA_DOCKER_DNS", "").strip()
 
-# set of valid regions
-VALID_PARTITIONS = set(Session().get_available_partitions())
-VALID_REGIONS = set()
-for partition in VALID_PARTITIONS:
-    for region in Session().get_available_regions("sns", partition):
-        VALID_REGIONS.add(region)
+# additional flags passed to Lambda Docker run/create commands
+LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "").strip()
+
+# default container registry for lambda execution images
+LAMBDA_CONTAINER_REGISTRY = (
+    os.environ.get("LAMBDA_CONTAINER_REGISTRY", "").strip() or DEFAULT_LAMBDA_CONTAINER_REGISTRY
+)
+
+# whether to remove containers after Lambdas finished executing
+LAMBDA_REMOVE_CONTAINERS = (
+    os.environ.get("LAMBDA_REMOVE_CONTAINERS", "").lower().strip() not in FALSE_STRINGS
+)
+
+# Adding Stepfunctions default port
+LOCAL_PORT_STEPFUNCTIONS = int(os.environ.get("LOCAL_PORT_STEPFUNCTIONS") or 8083)
+# Stepfunctions lambda endpoint override
+STEPFUNCTIONS_LAMBDA_ENDPOINT = os.environ.get("STEPFUNCTIONS_LAMBDA_ENDPOINT", "").strip()
+
+# path prefix for windows volume mounting
+WINDOWS_DOCKER_MOUNT_PREFIX = os.environ.get("WINDOWS_DOCKER_MOUNT_PREFIX", "/host_mnt")
+
+# whether to skip S3 presign URL signature validation (TODO: currently enabled, until all issues are resolved)
+S3_SKIP_SIGNATURE_VALIDATION = is_env_not_false("S3_SKIP_SIGNATURE_VALIDATION")
+
+# user ID of default user, to be returned on sts.get_caller_identity
+TEST_IAM_USER_ID = str(os.environ.get("TEST_IAM_USER_ID") or "").strip()
+TEST_IAM_USER_NAME = str(os.environ.get("TEST_IAM_USER_NAME") or "").strip()
+
+# whether to use Lambda functions in a Docker container
+LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "").strip()
+if not LAMBDA_EXECUTOR:
+    LAMBDA_EXECUTOR = "docker"
+    if not has_docker():
+        LAMBDA_EXECUTOR = "local"
+
+# Fallback URL to use when a non-existing Lambda is invoked. If this matches
+# `dynamodb://<table_name>`, then the invocation is recorded in the corresponding
+# DynamoDB table. If this matches `http(s)://...`, then the Lambda invocation is
+# forwarded as a POST request to that URL.
+LAMBDA_FALLBACK_URL = os.environ.get("LAMBDA_FALLBACK_URL", "").strip()
+# Forward URL used to forward any Lambda invocations to an external
+# endpoint (can use useful for advanced test setups)
+LAMBDA_FORWARD_URL = os.environ.get("LAMBDA_FORWARD_URL", "").strip()
+# Time in seconds to wait at max while extracting Lambda code.
+# By default, it is 25 seconds for limiting the execution time
+# to avoid client/network timeout issues
+LAMBDA_CODE_EXTRACT_TIME = int(os.environ.get("LAMBDA_CODE_EXTRACT_TIME") or 25)
+
+# whether lambdas should use stay open mode if executed in "docker-reuse" executor
+LAMBDA_STAY_OPEN_MODE = is_in_docker and is_env_not_false("LAMBDA_STAY_OPEN_MODE")
+
+# truncate output string slices value
+LAMBDA_TRUNCATE_STDOUT = int(os.getenv("LAMBDA_TRUNCATE_STDOUT") or 2000)
+
+# A comma-delimited string of stream names and its corresponding shard count to
+# initialize during startup.
+# For example: "my-first-stream:1,my-other-stream:2,my-last-stream:1"
+KINESIS_INITIALIZE_STREAMS = os.environ.get("KINESIS_INITIALIZE_STREAMS", "").strip()
+
+# URL to a custom OpenSearch/Elasticsearch backend cluster. If this is set to a valid URL, then localstack will not
+# create OpenSearch/Elasticsearch cluster instances, but instead forward all domains to the given backend.
+OPENSEARCH_CUSTOM_BACKEND = (
+    os.environ.get("OPENSEARCH_CUSTOM_BACKEND", "").strip()
+    or os.environ.get("ES_CUSTOM_BACKEND", "").strip()
+)
+
+# Strategy used when creating OpenSearch/Elasticsearch domain endpoints routed through the edge proxy
+# valid values: domain | path | port (off)
+OPENSEARCH_ENDPOINT_STRATEGY = (
+    os.environ.get("OPENSEARCH_ENDPOINT_STRATEGY", "").strip()
+    or os.environ.get("ES_ENDPOINT_STRATEGY", "").strip()
+    or "domain"
+)
+if OPENSEARCH_ENDPOINT_STRATEGY == "off":
+    OPENSEARCH_ENDPOINT_STRATEGY = "port"
+
+# Whether to start one cluster per domain (default), or multiplex opensearch domains to a single clusters
+OPENSEARCH_MULTI_CLUSTER = is_env_not_false("OPENSEARCH_MULTI_CLUSTER") or is_env_true(
+    "ES_MULTI_CLUSTER"
+)
+
+# list of environment variable names used for configuration.
+# Make sure to keep this in sync with the above!
+# Note: do *not* include DATA_DIR in this list, as it is treated separately
+CONFIG_ENV_VARS = [
+    "BUCKET_MARKER_LOCAL",
+    "DEBUG",
+    "DEFAULT_REGION",
+    "DEVELOP",
+    "DEVELOP_PORT",
+    "DISABLE_CORS_CHECKS",
+    "DISABLE_CUSTOM_CORS_APIGATEWAY",
+    "DISABLE_CUSTOM_CORS_S3",
+    "DISABLE_EVENTS",
+    "DOCKER_BRIDGE_IP",
+    "DYNAMODB_ERROR_PROBABILITY",
+    "DYNAMODB_HEAP_SIZE",
+    "DYNAMODB_READ_ERROR_PROBABILITY",
+    "DYNAMODB_WRITE_ERROR_PROBABILITY",
+    "EAGER_SERVICE_LOADING",
+    "EDGE_BIND_HOST",
+    "EDGE_FORWARD_URL",
+    "EDGE_PORT",
+    "EDGE_PORT_HTTP",
+    "ENABLE_CONFIG_UPDATES",
+    "ES_CUSTOM_BACKEND",
+    "ES_ENDPOINT_STRATEGY",
+    "ES_MULTI_CLUSTER",
+    "EXTRA_CORS_ALLOWED_HEADERS",
+    "EXTRA_CORS_ALLOWED_ORIGINS",
+    "EXTRA_CORS_EXPOSE_HEADERS",
+    "HOSTNAME",
+    "HOSTNAME_EXTERNAL",
+    "HOSTNAME_FROM_LAMBDA",
+    "KINESIS_ERROR_PROBABILITY",
+    "KINESIS_INITIALIZE_STREAMS",
+    "LAMBDA_CODE_EXTRACT_TIME",
+    "LAMBDA_CONTAINER_REGISTRY",
+    "LAMBDA_DOCKER_DNS",
+    "LAMBDA_DOCKER_FLAGS",
+    "LAMBDA_DOCKER_NETWORK",
+    "LAMBDA_EXECUTOR",
+    "LAMBDA_FALLBACK_URL",
+    "LAMBDA_FORWARD_URL",
+    "LAMBDA_JAVA_OPTS",
+    "LAMBDA_REMOTE_DOCKER",
+    "LAMBDA_REMOVE_CONTAINERS",
+    "LAMBDA_STAY_OPEN_MODE",
+    "LAMBDA_TRUNCATE_STDOUT",
+    "LEGACY_DOCKER_CLIENT",
+    "LOCALSTACK_API_KEY",
+    "LOCALSTACK_HOSTNAME",
+    "LOG_LICENSE_ISSUES",
+    "LS_LOG",
+    "MAIN_CONTAINER_NAME",
+    "OUTBOUND_HTTP_PROXY",
+    "OUTBOUND_HTTPS_PROXY",
+    "PERSISTENCE_SINGLE_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "S3_SKIP_SIGNATURE_VALIDATION",
+    "SERVICES",
+    "SKIP_INFRA_DOWNLOADS",
+    "SQS_PORT_EXTERNAL",
+    "STEPFUNCTIONS_LAMBDA_ENDPOINT",
+    "SYNCHRONOUS_API_GATEWAY_EVENTS",
+    "SYNCHRONOUS_DYNAMODB_EVENTS",
+    "SYNCHRONOUS_KINESIS_EVENTS",
+    "SYNCHRONOUS_SNS_EVENTS",
+    "SYNCHRONOUS_SQS_EVENTS",
+    "TEST_AWS_ACCOUNT_ID",
+    "TEST_IAM_USER_ID",
+    "TEST_IAM_USER_NAME",
+    "TF_COMPAT_MODE",
+    "THUNDRA_APIKEY",
+    "THUNDRA_AGENT_JAVA_VERSION",
+    "THUNDRA_AGENT_NODE_VERSION",
+    "THUNDRA_AGENT_PYTHON_VERSION",
+    "USE_SINGLE_REGION",
+    "USE_SSL",
+    "WAIT_FOR_DEBUGGER",
+    "WINDOWS_DOCKER_MOUNT_PREFIX",
+]
+
+
+def collect_config_items() -> List[Tuple[str, Any]]:
+    """Returns a list of key-value tuples of LocalStack configuration values."""
+    none = object()  # sentinel object
+
+    # collect which keys to print
+    keys = []
+    keys.extend(CONFIG_ENV_VARS)
+    keys.append("DATA_DIR")
+    keys.sort()
+
+    values = globals()
+
+    result = []
+    for k in keys:
+        v = values.get(k, none)
+        if v is none:
+            continue
+        result.append((k, v))
+    result.sort()
+    return result
 
 
 def parse_service_ports() -> Dict[str, int]:
@@ -529,35 +744,25 @@ def parse_service_ports() -> Dict[str, int]:
     return result
 
 
-# TODO: we need to investigate the performance impact of this
+# TODO: leaving temporarily for patch compatibilty - remove!
 def populate_configs(service_ports=None):
-    global SERVICE_PORTS, CONFIG_ENV_VARS
+    pass
 
-    SERVICE_PORTS = service_ports or parse_service_ports()
-    globs = globals()
-    protocol = get_protocol()
 
-    # define service ports and URLs as environment variables
+# TODO: use functools cache, instead of global variable here
+SERVICE_PORTS = parse_service_ports()
+
+
+def populate_config_env_var_names():
+    global CONFIG_ENV_VARS
+
     for key, value in six.iteritems(DEFAULT_SERVICE_PORTS):
-        key_upper = key.upper().replace("-", "_")
-
-        # define PORT_* variables with actual service ports as per configuration
-        port_var_name = "PORT_%s" % key_upper
-        port_number = service_port(key)
-        globs[port_var_name] = port_number
-        url = "%s://%s:%s" % (protocol, LOCALSTACK_HOSTNAME, port_number)
-        # define TEST_*_URL variables with mock service endpoints
-        url_key = "TEST_%s_URL" % key_upper
-        # allow overwriting TEST_*_URL from user-defined environment variables
-        existing = os.environ.get(url_key)
-        url = existing or url
-        # set global variable
-        globs[url_key] = url
-        # expose HOST_*_URL variables as environment variables
-        os.environ[url_key] = url
-
-    # expose LOCALSTACK_HOSTNAME as env. variable
-    os.environ["LOCALSTACK_HOSTNAME"] = LOCALSTACK_HOSTNAME
+        clean_key = key.upper().replace("-", "_")
+        CONFIG_ENV_VARS += [
+            clean_key + "_BACKEND",
+            clean_key + "_PORT_EXTERNAL",
+            "PROVIDER_OVERRIDE_" + clean_key,
+        ]
 
     # create variable aliases prefixed with LOCALSTACK_ (except LOCALSTACK_HOSTNAME)
     CONFIG_ENV_VARS += [
@@ -566,7 +771,15 @@ def populate_configs(service_ports=None):
     CONFIG_ENV_VARS = list(set(CONFIG_ENV_VARS))
 
 
-def service_port(service_key):
+# populate env var names to be passed to the container
+populate_config_env_var_names()
+
+
+def service_port(service_key: str, external: bool = False) -> int:
+    service_key = service_key.lower()
+    if external:
+        if service_key == "sqs" and SQS_PORT_EXTERNAL:
+            return SQS_PORT_EXTERNAL
     if FORWARD_EDGE_INMEM:
         if service_key == "elasticsearch":
             # TODO Elasticsearch domains are a special case - we do not want to route them through
@@ -581,9 +794,16 @@ def get_protocol():
     return "https" if USE_SSL else "http"
 
 
-def external_service_url(service_key, host=None):
+def service_url(service_key, host=None, port=None):
+    host = host or LOCALHOST
+    port = port or service_port(service_key)
+    return f"{get_protocol()}://{host}:{port}"
+
+
+def external_service_url(service_key, host=None, port=None):
     host = host or HOSTNAME_EXTERNAL
-    return "%s://%s:%s" % (get_protocol(), host, service_port(service_key))
+    port = port or service_port(service_key, external=True)
+    return service_url(service_key, host=host, port=port)
 
 
 def get_edge_port_http():
@@ -597,33 +817,17 @@ def get_edge_url(localstack_hostname=None, protocol=None):
     return "%s://%s:%s" % (protocol, localstack_hostname, port)
 
 
-# initialize config values
-populate_configs()
-
 # set log levels
 if DEBUG:
     logging.getLogger("").setLevel(logging.DEBUG)
     logging.getLogger("localstack").setLevel(logging.DEBUG)
 
-
-def load_config_file(config_file=None):
-    from localstack.utils.common import get_or_create_file, to_str
-
-    config_file = config_file or CONFIG_FILE_PATH
-    content = get_or_create_file(config_file, permissions=0o600)
-    try:
-        configs = json.loads(to_str(content) or "{}")
-    except Exception as e:
-        print("Unable to load local config file %s as JSON: %s" % (config_file, e))
-        return {}
-    return configs
-
-
-def save_config_file(config, config_file=None):
-    from localstack.utils.common import save_file
-
-    config_file = config_file or CONFIG_FILE_PATH
-    save_file(config_file, json.dumps(config), permissions=0o600)
+if LS_LOG in TRACE_LOG_LEVELS:
+    load_end_time = time.time()
+    LOG = logging.getLogger(__name__)
+    LOG.debug(
+        "Initializing the configuration took %s ms", int((load_end_time - load_start_time) * 1000)
+    )
 
 
 class ServiceProviderConfig(Mapping[str, str]):
@@ -631,7 +835,7 @@ class ServiceProviderConfig(Mapping[str, str]):
     default_value: str
 
     def __init__(self, default_value: str):
-        self._provider_config = dict()
+        self._provider_config = {}
         self.default_value = default_value
 
     def get_provider(self, service: str) -> str:
@@ -665,11 +869,22 @@ SERVICE_PROVIDER_CONFIG = ServiceProviderConfig("default")
 
 for key, value in os.environ.items():
     if key.startswith("PROVIDER_OVERRIDE_"):
-        SERVICE_PROVIDER_CONFIG.set_provider(key.lstrip("PROVIDER_OVERRIDE_").lower(), value)
+        SERVICE_PROVIDER_CONFIG.set_provider(
+            key.lstrip("PROVIDER_OVERRIDE_").lower().replace("_", "-"), value
+        )
 
-if LS_LOG in TRACE_LOG_LEVELS:
-    load_end_time = time.time()
-    LOG = logging.getLogger(__name__)
-    LOG.debug(
-        "Initializing the configuration took %s ms" % int((load_end_time - load_start_time) * 1000)
-    )
+# initialize directories
+if is_in_docker:
+    dirs = Directories.for_container()
+else:
+    dirs = Directories.from_config()
+
+dirs.mkdirs()
+
+# TODO: remove deprecation warning with next release
+for path in [dirs.config, os.path.join(dirs.tmp, ".localstack")]:
+    if path and os.path.isfile(path):
+        print(
+            f"warning: the config file .localstack is deprecated and no longer used, "
+            f"please remove it by running rm {path}"
+        )

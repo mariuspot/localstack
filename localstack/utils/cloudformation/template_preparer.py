@@ -3,13 +3,13 @@ import logging
 import os
 import re
 from typing import Optional
+from urllib.parse import urlparse
 
 import boto3
 import moto.cloudformation.utils
 import yaml
 from requests.structures import CaseInsensitiveDict
 from samtranslator.translator.transform import transform as transform_sam
-from six.moves.urllib import parse as urlparse
 
 from localstack import config, constants
 from localstack.services.s3 import s3_listener, s3_utils
@@ -119,12 +119,13 @@ def get_template_body(req_data):
             # check if this is an S3 URL, then get the file directly from there
             url = convert_s3_to_local_url(url)
             if is_local_service_url(url):
-                parsed_path = urlparse.urlparse(url).path.lstrip("/")
+                parsed_path = urlparse(url).path.lstrip("/")
                 parts = parsed_path.partition("/")
                 client = aws_stack.connect_to_service("s3")
                 LOG.debug(
-                    "Download CloudFormation template content from local S3: %s - %s"
-                    % (parts[0], parts[2])
+                    "Download CloudFormation template content from local S3: %s - %s",
+                    parts[0],
+                    parts[2],
                 )
                 result = client.get_object(Bucket=parts[0], Key=parts[2])
                 body = to_str(result["Body"].read())
@@ -149,7 +150,7 @@ def parse_template(template):
             try:
                 return clone_safe(yaml.load(template, Loader=NoDatesSafeLoader))
             except Exception as e:
-                LOG.debug("Unable to parse CloudFormation template (%s): %s" % (e, template))
+                LOG.debug("Unable to parse CloudFormation template (%s): %s", e, template)
                 raise
 
 
@@ -174,7 +175,7 @@ def is_local_service_url(url):
 
 
 def convert_s3_to_local_url(url):
-    url_parsed = urlparse.urlparse(url)
+    url_parsed = urlparse(url)
     path = url_parsed.path
 
     headers = CaseInsensitiveDict({"Host": url_parsed.netloc})
@@ -183,5 +184,5 @@ def convert_s3_to_local_url(url):
 
     # note: make sure to normalize the bucket name here!
     bucket_name = s3_listener.normalize_bucket_name(bucket_name)
-    local_url = "%s/%s/%s" % (config.TEST_S3_URL, bucket_name, key_name)
+    local_url = f"{config.service_url('s3')}/{bucket_name}/{key_name}"
     return local_url

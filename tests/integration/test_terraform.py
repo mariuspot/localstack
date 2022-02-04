@@ -4,11 +4,13 @@ import threading
 import unittest
 
 import pytest
-from packaging import version
 
+from localstack import config
+from localstack.services.install import TERRAFORM_BIN, install_terraform
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import is_command_available, rm_rf, run, start_worker_thread
 
+#  TODO: remove all of these
 BUCKET_NAME = "tf-bucket"
 QUEUE_NAME = "tf-queue"
 QUEUE_ARN = "arn:aws:sqs:us-east-1:000000000000:tf-queue"
@@ -24,51 +26,52 @@ INIT_LOCK = threading.RLock()
 
 
 def check_terraform_version():
-    if not is_command_available("terraform"):
+    if not is_command_available(TERRAFORM_BIN):
         return False, None
 
-    ver_string = run("terraform -version")
+    ver_string = run([TERRAFORM_BIN, "-version"])
     ver_string = re.search(r"v(\d+\.\d+\.\d+)", ver_string).group(1)
     if ver_string is None:
         return False, None
-    return version.parse(ver_string) < version.parse("0.15"), ver_string
+    return True, ver_string
 
 
+# TODO: replace "clouddrove/api-gateway/aws" with normal apigateway module and update terraform
+# TODO: rework this setup for multiple (potentially parallel) terraform tests by providing variables (see .auto.tfvars)
+# TODO: fetch generated ARNs from terraform instead of static/building ARNs
+# TODO: migrate to pytest
 class TestTerraform(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        available, version = check_terraform_version()
-
-        if not available:
-            msg = "could not find a compatible version of terraform"
-            if version:
-                msg += f" (version = {version})"
-            else:
-                msg += " (command not found)"
-
-            return pytest.skip(msg)
-
         with INIT_LOCK:
-            run("cd %s; terraform apply -input=false tfplan" % (cls.get_base_dir()))
+            if config.DEFAULT_REGION != "us-east-1":
+                pytest.skip("Currently only support us-east-1")
+            available, version = check_terraform_version()
+
+            if not available:
+                msg = "could not find a compatible version of terraform"
+                if version:
+                    msg += f" (version = {version})"
+                else:
+                    msg += " (command not found)"
+
+                return pytest.skip(msg)
+
+            run("cd %s; %s apply -input=false tfplan" % (cls.get_base_dir(), TERRAFORM_BIN))
 
     @classmethod
     def tearDownClass(cls):
-        run("cd %s; terraform destroy -auto-approve" % (cls.get_base_dir()))
+        run("cd %s; %s destroy -auto-approve" % (cls.get_base_dir(), TERRAFORM_BIN))
 
     @classmethod
     def init_async(cls):
-        available, ver_string = check_terraform_version()
-        if not available:
-            print(
-                "Skipping Terraform test init as version check failed (version: '%s')" % ver_string
-            )
-            return
-
         def _run(*args):
             with INIT_LOCK:
+                install_terraform()
+
                 base_dir = cls.get_base_dir()
                 if not os.path.exists(os.path.join(base_dir, ".terraform", "plugins")):
-                    run("cd %s; terraform init -input=false" % base_dir)
+                    run(f"cd {base_dir}; {TERRAFORM_BIN} init -input=false")
                 # remove any cache files from previous runs
                 for tf_file in [
                     "tfplan",
@@ -77,16 +80,17 @@ class TestTerraform(unittest.TestCase):
                 ]:
                     rm_rf(os.path.join(base_dir, tf_file))
                 # create TF plan
-                run("cd %s; terraform plan -out=tfplan -input=false" % base_dir)
+                run(f"cd {base_dir}; {TERRAFORM_BIN} plan -out=tfplan -input=false")
 
         start_worker_thread(_run)
 
     @classmethod
-    def get_base_dir(*args):
+    def get_base_dir(cls):
         return os.path.join(os.path.dirname(__file__), "terraform")
 
+    @pytest.mark.skip_offline
     def test_bucket_exists(self):
-        s3_client = aws_stack.connect_to_service("s3")
+        s3_client = aws_stack.create_external_boto_client("s3")
 
         response = s3_client.head_bucket(Bucket=BUCKET_NAME)
         self.assertEqual(200, response["ResponseMetadata"]["HTTPStatusCode"])
@@ -105,8 +109,9 @@ class TestTerraform(unittest.TestCase):
         response = s3_client.get_bucket_versioning(Bucket=BUCKET_NAME)
         self.assertEqual("Enabled", response["Status"])
 
+    @pytest.mark.skip_offline
     def test_sqs(self):
-        sqs_client = aws_stack.connect_to_service("sqs")
+        sqs_client = aws_stack.create_external_boto_client("sqs")
         queue_url = sqs_client.get_queue_url(QueueName=QUEUE_NAME)["QueueUrl"]
         response = sqs_client.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["All"])
 
@@ -115,16 +120,18 @@ class TestTerraform(unittest.TestCase):
         self.assertEqual("86400", response["Attributes"]["MessageRetentionPeriod"])
         self.assertEqual("10", response["Attributes"]["ReceiveMessageWaitTimeSeconds"])
 
+    @pytest.mark.skip_offline
     def test_lambda(self):
-        lambda_client = aws_stack.connect_to_service("lambda")
+        lambda_client = aws_stack.create_external_boto_client("lambda")
         response = lambda_client.get_function(FunctionName=LAMBDA_NAME)
         self.assertEqual(LAMBDA_NAME, response["Configuration"]["FunctionName"])
         self.assertEqual(LAMBDA_HANDLER, response["Configuration"]["Handler"])
         self.assertEqual(LAMBDA_RUNTIME, response["Configuration"]["Runtime"])
         self.assertEqual(LAMBDA_ROLE, response["Configuration"]["Role"])
 
+    @pytest.mark.skip_offline
     def test_event_source_mapping(self):
-        lambda_client = aws_stack.connect_to_service("lambda")
+        lambda_client = aws_stack.create_external_boto_client("lambda")
         all_mappings = lambda_client.list_event_source_mappings(
             EventSourceArn=QUEUE_ARN, FunctionName=LAMBDA_NAME
         )
@@ -132,8 +139,9 @@ class TestTerraform(unittest.TestCase):
         assert function_mapping["FunctionArn"] == LAMBDA_ARN
         assert function_mapping["EventSourceArn"] == QUEUE_ARN
 
+    @pytest.mark.skip_offline
     def test_apigateway(self):
-        apigateway_client = aws_stack.connect_to_service("apigateway")
+        apigateway_client = aws_stack.create_external_boto_client("apigateway")
         rest_apis = apigateway_client.get_rest_apis()
 
         rest_id = None
@@ -163,8 +171,9 @@ class TestTerraform(unittest.TestCase):
         )
         self.assertTrue(res2[0]["resourceMethods"]["GET"]["methodIntegration"]["uri"])
 
+    @pytest.mark.skip_offline
     def test_route53(self):
-        route53 = aws_stack.connect_to_service("route53")
+        route53 = aws_stack.create_external_boto_client("route53")
 
         response = route53.create_hosted_zone(Name="zone123", CallerReference="ref123")
         self.assertEqual(201, response["ResponseMetadata"]["HTTPStatusCode"])
@@ -173,15 +182,17 @@ class TestTerraform(unittest.TestCase):
         response = route53.get_change(Id=change_id)
         self.assertEqual(200, response["ResponseMetadata"]["HTTPStatusCode"])
 
+    @pytest.mark.skip_offline
     def test_acm(self):
-        acm = aws_stack.connect_to_service("acm")
+        acm = aws_stack.create_external_boto_client("acm")
 
         certs = acm.list_certificates()["CertificateSummaryList"]
         certs = [c for c in certs if c.get("DomainName") == "example.com"]
         self.assertEqual(1, len(certs))
 
+    @pytest.mark.skip_offline
     def test_apigateway_escaped_policy(self):
-        apigateway_client = aws_stack.connect_to_service("apigateway")
+        apigateway_client = aws_stack.create_external_boto_client("apigateway")
         rest_apis = apigateway_client.get_rest_apis()
 
         service_apis = []
@@ -192,11 +203,12 @@ class TestTerraform(unittest.TestCase):
 
         self.assertEqual(1, len(service_apis))
 
+    @pytest.mark.skip_offline
     def test_dynamodb(self):
         def _table_exists(tablename, dynamotables):
             return any(name for name in dynamotables["TableNames"] if name == tablename)
 
-        dynamo_client = aws_stack.connect_to_service("dynamodb")
+        dynamo_client = aws_stack.create_external_boto_client("dynamodb")
         tables = dynamo_client.list_tables()
         self.assertTrue(_table_exists("tf_dynamotable1", tables))
         self.assertTrue(_table_exists("tf_dynamotable2", tables))

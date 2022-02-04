@@ -1,7 +1,8 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from urllib import parse as urlparse
 
 from botocore.utils import InvalidArnException
 from jsonpatch import apply_patch
@@ -9,7 +10,6 @@ from jsonpointer import JsonPointerException
 from moto.apigateway import models as apigateway_models
 from moto.apigateway.utils import create_id as create_resource_id
 from requests.models import Response
-from six.moves.urllib import parse as urlparse
 
 from localstack import config
 from localstack.constants import APPLICATION_JSON, PATH_USER_REQUEST, TEST_AWS_ACCOUNT_ID
@@ -871,7 +871,7 @@ def find_api_subentity_by_id(api_id, entity_id, map_name):
 def gateway_request_url(api_id, stage_name, path):
     """Return URL for inbound API gateway for given API ID, stage name, and path"""
     pattern = "%s/restapis/{api_id}/{stage_name}/%s{path}" % (
-        config.TEST_APIGATEWAY_URL,
+        config.service_url("apigateway"),
         PATH_USER_REQUEST,
     )
     return pattern.format(api_id=api_id, stage_name=stage_name, path=path)
@@ -881,24 +881,26 @@ def tokenize_path(path):
     return path.lstrip("/").split("/")
 
 
-def extract_path_params(path, extracted_path):
+def extract_path_params(path: str, extracted_path: str) -> Dict[str, str]:
     tokenized_extracted_path = tokenize_path(extracted_path)
     # Looks for '{' in the tokenized extracted path
     path_params_list = [(i, v) for i, v in enumerate(tokenized_extracted_path) if "{" in v]
     tokenized_path = tokenize_path(path)
     path_params = {}
     for param in path_params_list:
-        path_param_name = param[1][1:-1].encode("utf-8")
+        path_param_name = param[1][1:-1]
         path_param_position = param[0]
-        if path_param_name.endswith(b"+"):
-            path_params[path_param_name] = "/".join(tokenized_path[path_param_position:])
+        if path_param_name.endswith("+"):
+            path_params[path_param_name.rstrip("+")] = "/".join(
+                tokenized_path[path_param_position:]
+            )
         else:
             path_params[path_param_name] = tokenized_path[path_param_position]
     path_params = common.json_safe(path_params)
     return path_params
 
 
-def extract_query_string_params(path):
+def extract_query_string_params(path: str) -> Tuple[str, Dict[str, str]]:
     parsed_path = urlparse.urlparse(path)
     path = parsed_path.path
     parsed_query_string_params = urlparse.parse_qs(parsed_path.query)
@@ -934,7 +936,8 @@ def get_rest_api_paths(rest_api_id, region_name=None):
     resource_map = {}
     for resource in resources["items"]:
         path = resource.get("path")
-        # TODO: check if this is still required in the general case (can we rely on "path" being present?)
+        # TODO: check if this is still required in the general case (can we rely on "path" being
+        #  present?)
         path = path or aws_stack.get_apigateway_path_for_resource(
             rest_api_id, resource["id"], region_name=region_name
         )
@@ -942,36 +945,58 @@ def get_rest_api_paths(rest_api_id, region_name=None):
     return resource_map
 
 
-def get_resource_for_path(path: str, path_map: Dict[str, Dict]) -> Tuple[str, Dict]:
+# TODO: Extract this to a set of rules that have precedence and easy to test individually.
+#
+#  https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-method-settings
+#  -method-request.html
+#  https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-routes.html
+def get_resource_for_path(path: str, path_map: Dict[str, Dict]) -> Optional[Tuple[str, dict]]:
     matches = []
+    # creates a regex from the input path if there are parameters, e.g /foo/{bar}/baz -> /foo/[
+    # ^\]+/baz, otherwise is a direct match.
     for api_path, details in path_map.items():
-        api_path_regex = re.sub(r"\{[^\+]+\+\}", r"[^\?#]+", api_path)
-        api_path_regex = re.sub(r"\{[^\}]+\}", r"[^/]+", api_path_regex)
+        api_path_regex = re.sub(r"{[^+]+\+}", r"[^\?#]+", api_path)
+        api_path_regex = re.sub(r"{[^}]+}", r"[^/]+", api_path_regex)
         if re.match(r"^%s$" % api_path_regex, path):
             matches.append((api_path, details))
+
+    # if there are no matches, it's not worth to proceed, bail here!
     if not matches:
         return None
+
+    # so we have matches and perhaps more than one, e.g
+    # /{proxy+} and /api/{proxy+} for inputs like /api/foo/bar
+    # /foo/{param1}/baz and /foo/{param1}/{param2} for inputs like /for/bar/baz
     if len(matches) > 1:
-        # check if we have an exact match
+        # check if we have an exact match (exact matches take precedence)
         for match in matches:
             if match[0] == path:
                 return match
+
+        # not an exact match but parameters can fit in
+        for match in matches:
             if path_matches_pattern(path, match[0]):
                 return match
-        raise Exception("Ambiguous API path %s - matches found: %s" % (path, matches))
+
+        # at this stage, we have more than one match but we have an eager example like
+        # /{proxy+} or /api/{proxy+}, so we pick the best match by sorting by length
+        sorted_matches = sorted(matches, key=lambda x: len(x[0]), reverse=True)
+        return sorted_matches[0]
     return matches[0]
 
 
 def path_matches_pattern(path, api_path):
     api_paths = api_path.split("/")
     paths = path.split("/")
-    reg_check = re.compile(r"\{(.*)\}")
-    results = []
+    reg_check = re.compile(r"{(.*)}")
     if len(api_paths) != len(paths):
         return False
-    for indx, part in enumerate(api_paths):
-        if reg_check.match(part) is None and part:
-            results.append(part == paths[indx])
+    results = [
+        part == paths[indx]
+        for indx, part in enumerate(api_paths)
+        if reg_check.match(part) is None and part
+    ]
+
     return len(results) > 0 and all(results)
 
 
@@ -1012,7 +1037,8 @@ def connect_api_gateway_to_sqs(gateway_name, stage_name, queue_arn, path, region
 
 
 def apply_json_patch_safe(subject, patch_operations, in_place=True, return_list=False):
-    """Apply JSONPatch operations, using some customizations for compatibility with API GW resources."""
+    """Apply JSONPatch operations, using some customizations for compatibility with API GW
+    resources."""
 
     results = []
     patch_operations = (
@@ -1025,7 +1051,7 @@ def apply_json_patch_safe(subject, patch_operations, in_place=True, return_list=
                 operation["value"] = ""
 
             if operation["op"] != "remove" and operation.get("value") is None:
-                LOG.info('Missing "value" in JSONPatch operation for %s: %s' % (subject, operation))
+                LOG.info('Missing "value" in JSONPatch operation for %s: %s', subject, operation)
                 continue
 
             if operation["op"] == "add":
@@ -1094,7 +1120,7 @@ def import_api_from_openapi_spec(
         child_id = create_resource_id()
         path = path or "/"
         child = apigateway_models.Resource(
-            id=child_id,
+            resource_id=child_id,
             region_name=rest_api.region_name,
             api_id=rest_api.id,
             path_part=parts[-1] or "/",

@@ -7,8 +7,10 @@ import unittest
 
 import mock
 
+from localstack.config import TMP_FOLDER
 from localstack.constants import LAMBDA_TEST_ROLE, TEST_AWS_ACCOUNT_ID
 from localstack.services.awslambda import lambda_api, lambda_executors, lambda_utils
+from localstack.services.awslambda.lambda_executors import OutputLog
 from localstack.services.awslambda.lambda_utils import API_PATH_ROOT
 from localstack.utils.aws import aws_stack
 from localstack.utils.aws.aws_models import LambdaFunction
@@ -434,7 +436,7 @@ class TestLambdaAPI(unittest.TestCase):
                 "RevisionId", None
             )  # we need to remove this, since this is random, so we cannot know its value
 
-            expected_result = dict()
+            expected_result = {}
             expected_result["CodeSize"] = self.CODE_SIZE
             expected_result["CodeSha256"] = self.CODE_SHA_256
             expected_result["FunctionArn"] = str(lambda_api.func_arn(self.FUNCTION_NAME)) + ":1"
@@ -454,7 +456,9 @@ class TestLambdaAPI(unittest.TestCase):
             expected_result["LastUpdateStatus"] = "Successful"
             expected_result["PackageType"] = None
             expected_result["ImageConfig"] = {}
-            self.assertDictEqual(expected_result, result)
+            expected_result["Architectures"] = ["x86_64"]
+            # Check that the result contains the expected fields (some pro extensions could add additional fields)
+            self.assertDictContainsSubset(expected_result, result)
 
     def test_publish_update_version_increment(self):
         with self.app.test_request_context():
@@ -467,7 +471,7 @@ class TestLambdaAPI(unittest.TestCase):
                 "RevisionId", None
             )  # we need to remove this, since this is random, so we cannot know its value
 
-            expected_result = dict()
+            expected_result = {}
             expected_result["CodeSize"] = self.CODE_SIZE
             expected_result["CodeSha256"] = self.UPDATED_CODE_SHA_256
             expected_result["FunctionArn"] = str(lambda_api.func_arn(self.FUNCTION_NAME)) + ":2"
@@ -487,7 +491,9 @@ class TestLambdaAPI(unittest.TestCase):
             expected_result["LastUpdateStatus"] = "Successful"
             expected_result["PackageType"] = None
             expected_result["ImageConfig"] = {}
-            self.assertDictEqual(expected_result, result)
+            expected_result["Architectures"] = ["x86_64"]
+            # Check that the result contains the expected fields (some pro extensions could add additional fields)
+            self.assertDictContainsSubset(expected_result, result)
 
     def test_publish_non_existant_function_version_returns_error(self):
         with self.app.test_request_context():
@@ -509,7 +515,7 @@ class TestLambdaAPI(unittest.TestCase):
                 # we need to remove this, since this is random, so we cannot know its value
                 version.pop("RevisionId", None)
 
-            latest_version = dict()
+            latest_version = {}
             latest_version["CodeSize"] = self.CODE_SIZE
             latest_version["CodeSha256"] = self.CODE_SHA_256
             latest_version["FunctionArn"] = (
@@ -531,13 +537,21 @@ class TestLambdaAPI(unittest.TestCase):
             latest_version["LastUpdateStatus"] = "Successful"
             latest_version["PackageType"] = None
             latest_version["ImageConfig"] = {}
+            latest_version["Architectures"] = ["x86_64"]
             version1 = dict(latest_version)
             version1["FunctionArn"] = str(lambda_api.func_arn(self.FUNCTION_NAME)) + ":1"
             version1["Version"] = "1"
-            expected_result = {
-                "Versions": sorted([latest_version, version], key=lambda k: str(k.get("Version")))
-            }
-            self.assertDictEqual(expected_result, result)
+            expected_versions = sorted(
+                [latest_version, version], key=lambda k: str(k.get("Version"))
+            )
+
+            # Check if the result contains the same amount of versions and that they contain at least the defined fields
+            # (some pro extensions could add additional fields)
+            self.assertIn("Versions", result)
+            result_versions = result["Versions"]
+            self.assertEqual(len(result_versions), len(expected_versions))
+            for i in range(len(expected_versions)):
+                self.assertDictContainsSubset(expected_versions[i], result_versions[i])
 
     def test_list_non_existant_function_versions_returns_error(self):
         with self.app.test_request_context():
@@ -866,7 +880,7 @@ class TestLambdaAPI(unittest.TestCase):
             ).get_data()
         )
 
-        expected_response = dict()
+        expected_response = {}
         expected_response["LastUpdateStatus"] = "Successful"
         expected_response["FunctionName"] = str(self.FUNCTION_NAME)
         expected_response["Runtime"] = str(self.RUNTIME)
@@ -991,7 +1005,9 @@ class TestLambdaAPI(unittest.TestCase):
         date_part = "/".join(parts[:3])
         self.assertEqual(date_part, today)
 
-    def _create_function(self, function_name, tags={}):
+    def _create_function(self, function_name, tags=None):
+        if tags is None:
+            tags = {}
         region = lambda_api.LambdaRegion.get()
         arn = lambda_api.func_arn(function_name)
         region.lambdas[arn] = LambdaFunction(arn)
@@ -1011,7 +1027,9 @@ class TestLambdaAPI(unittest.TestCase):
         region.lambdas[arn].role = self.ROLE
         region.lambdas[arn].memory_size = self.MEMORY_SIZE
 
-    def _update_function_code(self, function_name, tags={}):
+    def _update_function_code(self, function_name, tags=None):
+        if tags is None:
+            tags = {}
         region = lambda_api.LambdaRegion.get()
         arn = lambda_api.func_arn(function_name)
         region.lambdas[arn].versions.update(
@@ -1026,6 +1044,30 @@ class TestLambdaAPI(unittest.TestCase):
 
     def _assert_contained(self, child, parent):
         self.assertTrue(set(child.items()).issubset(set(parent.items())))
+
+    @mock.patch("tempfile.NamedTemporaryFile")
+    def test_lambda_output(self, temp):
+        stderr = """START RequestId: 14c6eaeb-9183-4461-b520-10c4c64a2b07 Version: $LATEST
+        2022-01-27T12:57:39.071Z	14c6eaeb-9183-4461-b520-10c4c64a2b07 INFO {}
+        2022-01-27T12:57:39.071Z	14c6eaeb-9183-4461-b520-10c4c64a2b07 INFO {
+        callbackWaitsForEmptyEventLoop: [Getter/Setter], succeed: [Function (anonymous)],
+        fail: [Function (anonymous)], done: [Function (anonymous)], functionVersion: '$LATEST',
+        functionName: 'hello', memoryLimitInMB: '128', logGroupName: '/aws/lambda/hello',
+        logStreamName: '2022/01/27/[$LATEST]44deffbc11404f459e2cf38bb2fae611', clientContext:
+        undefined, identity: undefined, invokedFunctionArn:
+        'arn:aws:lambda:eu-west-1:659676821118:function:hello', awsRequestId:
+        '14c6eaeb-9183-4461-b520-10c4c64a2b07', getRemainingTimeInMillis: [Function:
+        getRemainingTimeInMillis] } END RequestId: 14c6eaeb-9183-4461-b520-10c4c64a2b07 REPORT
+        RequestId: 14c6eaeb-9183-4461-b520-10c4c64a2b07	Duration: 1.61 ms	Billed Duration: 2
+        ms	Memory Size: 128 MB	Max Memory Used: 58 MB """
+
+        output = OutputLog(stdout='{"hello":"world"}', stderr=stderr)
+        self.assertEqual('{"hello":"world"}', output.stdout_formatted())
+        self.assertEqual("START...", output.stderr_formatted(truncated_to=5))
+
+        output.output_file()
+
+        temp.assert_called_once_with(dir=TMP_FOLDER, delete=False, suffix=".log", prefix="lambda_")
 
 
 class TestLambdaEventInvokeConfig(unittest.TestCase):
@@ -1044,7 +1086,9 @@ class TestLambdaEventInvokeConfig(unittest.TestCase):
     DL_QUEUE = "arn:aws:sqs:us-east-1:000000000000:dlQueue"
     LAMBDA_OBJ = LambdaFunction(lambda_api.func_arn("test1"))
 
-    def _create_function(self, function_name, tags={}):
+    def _create_function(self, function_name, tags=None):
+        if tags is None:
+            tags = {}
         self.LAMBDA_OBJ.versions = {
             "$LATEST": {
                 "CodeSize": self.CODE_SIZE,

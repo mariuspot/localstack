@@ -28,7 +28,7 @@ LOCALHOST_IP = "127.0.0.1"
 LOCALHOST_HOSTNAME = "localhost.localstack.cloud"
 
 # version of the Maven dependency with Java utility code
-LOCALSTACK_MAVEN_VERSION = "0.2.17"
+LOCALSTACK_MAVEN_VERSION = "0.2.19"
 
 # map of default service APIs and ports to be spun up (fetch map from localstack_client)
 DEFAULT_SERVICE_PORTS = localstack_client.config.get_service_ports()
@@ -36,7 +36,7 @@ DEFAULT_SERVICE_PORTS = localstack_client.config.get_service_ports()
 # host to bind to when starting the services
 BIND_HOST = "0.0.0.0"
 
-# AWS user account ID used for tests
+# AWS user account ID used for tests - TODO move to config.py
 if "TEST_AWS_ACCOUNT_ID" not in os.environ:
     os.environ["TEST_AWS_ACCOUNT_ID"] = "000000000000"
 TEST_AWS_ACCOUNT_ID = os.environ["TEST_AWS_ACCOUNT_ID"]
@@ -45,15 +45,20 @@ TEST_AWS_ACCOUNT_ID = os.environ["TEST_AWS_ACCOUNT_ID"]
 MODULE_MAIN_PATH = os.path.dirname(os.path.realpath(__file__))
 # TODO rename to "ROOT_FOLDER"!
 LOCALSTACK_ROOT_FOLDER = os.path.realpath(os.path.join(MODULE_MAIN_PATH, ".."))
-INSTALL_DIR_INFRA = os.path.join(MODULE_MAIN_PATH, "infra")
+INSTALL_DIR_INFRA = os.path.join(
+    MODULE_MAIN_PATH, "infra"
+)  # FIXME: deprecated, use config.dirs.infra
 
 # virtualenv folder
-LOCALSTACK_VENV_FOLDER = os.path.join(LOCALSTACK_ROOT_FOLDER, ".venv")
-if not os.path.isdir(LOCALSTACK_VENV_FOLDER):
-    # assuming this package lives here: <python>/lib/pythonX.X/site-packages/localstack/
-    LOCALSTACK_VENV_FOLDER = os.path.realpath(
-        os.path.join(LOCALSTACK_ROOT_FOLDER, "..", "..", "..")
-    )
+LOCALSTACK_VENV_FOLDER = os.environ.get("VIRTUAL_ENV")
+if not LOCALSTACK_VENV_FOLDER:
+    # fallback to the previous logic
+    LOCALSTACK_VENV_FOLDER = os.path.join(LOCALSTACK_ROOT_FOLDER, ".venv")
+    if not os.path.isdir(LOCALSTACK_VENV_FOLDER):
+        # assuming this package lives here: <python>/lib/pythonX.X/site-packages/localstack/
+        LOCALSTACK_VENV_FOLDER = os.path.realpath(
+            os.path.join(LOCALSTACK_ROOT_FOLDER, "..", "..", "..")
+        )
 
 # API Gateway path to indicate a user request sent to the gateway
 PATH_USER_REQUEST = "_user_request_"
@@ -74,7 +79,7 @@ ENV_INTERNAL_TEST_RUN = "LOCALSTACK_INTERNAL_TEST_RUN"
 # environment variable that flags whether pro was activated. do not use for security purposes!
 ENV_PRO_ACTIVATED = "PRO_ACTIVATED"
 
-# content types
+# content types / encodings
 HEADER_CONTENT_TYPE = "Content-Type"
 APPLICATION_AMZ_JSON_1_0 = "application/x-amz-json-1.0"
 APPLICATION_AMZ_JSON_1_1 = "application/x-amz-json-1.1"
@@ -84,6 +89,7 @@ APPLICATION_JSON = "application/json"
 APPLICATION_XML = "application/xml"
 APPLICATION_OCTET_STREAM = "application/octet-stream"
 APPLICATION_X_WWW_FORM_URLENCODED = "application/x-www-form-urlencoded"
+HEADER_ACCEPT_ENCODING = "Accept-Encoding"
 
 # strings to indicate truthy/falsy values
 TRUE_STRINGS = ("1", "true", "True")
@@ -95,7 +101,7 @@ LOG_LEVELS = ("trace-internal", "trace", "debug", "info", "warn", "error", "warn
 LAMBDA_TEST_ROLE = "arn:aws:iam::%s:role/lambda-test-role" % TEST_AWS_ACCOUNT_ID
 
 # the version of elasticsearch that is pre-seeded into the base image (sync with Dockerfile.base)
-ELASTICSEARCH_DEFAULT_VERSION = "7.10.0"
+ELASTICSEARCH_DEFAULT_VERSION = "Elasticsearch_7.10"
 # See https://docs.aws.amazon.com/ja_jp/elasticsearch-service/latest/developerguide/aes-supported-plugins.html
 ELASTICSEARCH_PLUGIN_LIST = [
     "analysis-icu",
@@ -110,15 +116,17 @@ ELASTICSEARCH_PLUGIN_LIST = [
 ]
 # Default ES modules to exclude (save apprx 66MB in the final image)
 ELASTICSEARCH_DELETE_MODULES = ["ingest-geoip"]
+
+# the version of opensearch which is used by default
+OPENSEARCH_DEFAULT_VERSION = "OpenSearch_1.1"
+
 ELASTICMQ_JAR_URL = (
     "https://s3-eu-west-1.amazonaws.com/softwaremill-public/elasticmq-server-1.1.0.jar"
 )
 STS_JAR_URL = "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-sts/1.11.14/aws-java-sdk-sts-1.11.14.jar"
 STEPFUNCTIONS_ZIP_URL = "https://s3.amazonaws.com/stepfunctionslocal/StepFunctionsLocal.zip"
-KMS_URL_PATTERN = "https://s3-eu-west-2.amazonaws.com/local-kms/localstack/v3/local-kms.<arch>.bin"
+KMS_URL_PATTERN = "https://s3-eu-west-2.amazonaws.com/local-kms/3/local-kms_<arch>.bin"
 
-# TODO: Temporarily using a fixed version of DDB in Alpine, as we're hitting a SIGSEGV JVM crash with latest
-DYNAMODB_JAR_URL_ALPINE = "https://github.com/localstack/localstack-artifacts/raw/master/dynamodb-local-patch/etc/DynamoDBLocal.zip"
 DYNAMODB_JAR_URL = "https://s3-us-west-2.amazonaws.com/dynamodb-local/dynamodb_local_latest.zip"
 
 # API endpoint for analytics events
@@ -184,5 +192,8 @@ DEFAULT_DEVELOP_PORT = 5678
 # Default bucket name of the s3 bucket used for local lambda development
 DEFAULT_BUCKET_MARKER_LOCAL = "__local__"
 
-# user that starts the elasticsearch process if the current user is root
-OS_USER_ELASTICSEARCH = "localstack"
+# user that starts the opensearch process if the current user is root
+OS_USER_OPENSEARCH = "localstack"
+
+# output string that indicates that the stack is ready
+READY_MARKER_OUTPUT = "Ready."

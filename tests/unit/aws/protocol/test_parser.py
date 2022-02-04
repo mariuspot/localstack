@@ -4,7 +4,7 @@ from urllib.parse import urlencode
 from botocore.serialize import create_serializer
 
 from localstack.aws.api import HttpRequest
-from localstack.aws.protocol.parser import QueryRequestParser, create_parser
+from localstack.aws.protocol.parser import QueryRequestParser, RestJSONRequestParser, create_parser
 from localstack.aws.spec import load_service
 from localstack.utils.common import to_bytes
 
@@ -192,30 +192,38 @@ def test_query_parser_flattened_list_structure():
 
 
 def _botocore_parser_integration_test(
-    service: str,
-    action: str,
-    method: str = None,
-    request_uri: str = None,
-    headers: dict = None,
-    expected: dict = None,
-    **kwargs
+    service: str, action: str, headers: dict = None, expected: dict = None, **kwargs
 ):
     # Load the appropriate service
     service = load_service(service)
     # Use the serializer from botocore to serialize the request params
     serializer = create_serializer(service.protocol)
-    serialized_request = serializer.serialize_to_request(kwargs, service.operation_model(action))
-    serialized_request["path"] = request_uri
-    serialized_request["method"] = method
-    serialized_request["headers"] = headers
+
+    operation_model = service.operation_model(action)
+    serialized_request = serializer.serialize_to_request(kwargs, operation_model)
+    body = serialized_request["body"]
+    query_string = urlencode(serialized_request.get("query_string") or "", doseq=False)
+    # use custom headers (if provided), or headers from serialized request as default
+    headers = serialized_request.get("headers") if headers is None else headers
 
     if service.protocol in ["query", "ec2"]:
         # Serialize the body as query parameter
-        serialized_request["body"] = urlencode(serialized_request["body"])
+        body = urlencode(serialized_request["body"])
 
     # Use our parser to parse the serialized body
     parser = create_parser(service)
-    operation_model, parsed_request = parser.parse(serialized_request)
+    parsed_operation_model, parsed_request = parser.parse(
+        HttpRequest(
+            method=serialized_request.get("method") or "GET",
+            path=serialized_request.get("url_path") or "",
+            query_string=query_string,
+            headers=headers,
+            body=body,
+        )
+    )
+
+    # Check if the determined operation_model is correct
+    assert parsed_operation_model == operation_model
 
     # Check if the result is equal to the given "expected" dict or the kwargs (if "expected" has not been set)
     assert parsed_request == (expected or kwargs)
@@ -317,8 +325,6 @@ def test_restxml_parser_route53_with_botocore():
     _botocore_parser_integration_test(
         service="route53",
         action="CreateHostedZone",
-        method="POST",
-        request_uri="/2013-04-01/hostedzone",
         Name="string",
         VPC={"VPCRegion": "us-east-1", "VPCId": "string"},
         CallerReference="string",
@@ -331,8 +337,6 @@ def test_json_parser_cognito_with_botocore():
     _botocore_parser_integration_test(
         service="cognito-idp",
         action="CreateUserPool",
-        method="POST",
-        request_uri="/",
         headers={"X-Amz-Target": "AWSCognitoIdentityProviderService.CreateUserPool"},
         PoolName="string",
         Policies={
@@ -429,8 +433,6 @@ def test_restjson_parser_xray_with_botocore():
     _botocore_parser_integration_test(
         service="xray",
         action="PutTelemetryRecords",
-        method="POST",
-        request_uri="/TelemetryRecords",
         TelemetryRecords=[
             {
                 "Timestamp": datetime(2015, 1, 1),
@@ -451,6 +453,112 @@ def test_restjson_parser_xray_with_botocore():
         EC2InstanceId="string",
         Hostname="string",
         ResourceARN="string",
+    )
+
+
+def test_restjson_path_location_opensearch_with_botocore():
+    _botocore_parser_integration_test(
+        service="opensearch",
+        action="DeleteDomain",
+        DomainName="test-domain",
+    )
+
+
+def test_restjson_query_location_opensearch_with_botocore():
+    _botocore_parser_integration_test(
+        service="opensearch",
+        action="ListVersions",
+        NextToken="test-token",
+    )
+
+
+def test_restjson_opensearch_with_botocore():
+    _botocore_parser_integration_test(
+        service="opensearch",
+        action="UpdateDomainConfig",
+        DomainName="string",
+        ClusterConfig={
+            "InstanceType": "m3.medium.search",
+            "InstanceCount": 123,
+            "DedicatedMasterEnabled": True,
+            "ZoneAwarenessEnabled": True,
+            "ZoneAwarenessConfig": {"AvailabilityZoneCount": 123},
+            "DedicatedMasterType": "m3.medium.search",
+            "DedicatedMasterCount": 123,
+            "WarmEnabled": True,
+            "WarmType": "ultrawarm1.medium.search",
+            "WarmCount": 123,
+            "ColdStorageOptions": {"Enabled": True},
+        },
+        EBSOptions={"EBSEnabled": False, "VolumeType": "standard", "VolumeSize": 123, "Iops": 123},
+        SnapshotOptions={"AutomatedSnapshotStartHour": 123},
+        VPCOptions={
+            "SubnetIds": [
+                "string",
+            ],
+            "SecurityGroupIds": [
+                "string",
+            ],
+        },
+        CognitoOptions={
+            "Enabled": True,
+            "UserPoolId": "string",
+            "IdentityPoolId": "string",
+            "RoleArn": "12345678901234567890",
+        },
+        AdvancedOptions={"string": "string"},
+        AccessPolicies="string",
+        LogPublishingOptions={
+            "string": {"CloudWatchLogsLogGroupArn": "12345678901234567890", "Enabled": True}
+        },
+        EncryptionAtRestOptions={"Enabled": False, "KmsKeyId": "string"},
+        DomainEndpointOptions={
+            "EnforceHTTPS": True,
+            "TLSSecurityPolicy": "Policy-Min-TLS-1-0-2019-07",
+            "CustomEndpointEnabled": True,
+            "CustomEndpoint": "string",
+            "CustomEndpointCertificateArn": "12345678901234567890",
+        },
+        NodeToNodeEncryptionOptions={"Enabled": True},
+        AdvancedSecurityOptions={
+            "Enabled": True,
+            "InternalUserDatabaseEnabled": True,
+            "MasterUserOptions": {
+                "MasterUserARN": "12345678901234567890",
+                "MasterUserName": "string",
+                "MasterUserPassword": "12345678",
+            },
+            "SAMLOptions": {
+                "Enabled": True,
+                "Idp": {"MetadataContent": "string", "EntityId": "12345678"},
+                "MasterUserName": "string",
+                "MasterBackendRole": "string",
+                "SubjectKey": "string",
+                "RolesKey": "string",
+                "SessionTimeoutMinutes": 123,
+            },
+        },
+        AutoTuneOptions={
+            "DesiredState": "ENABLED",
+            "RollbackOnDisable": "DEFAULT_ROLLBACK",
+            "MaintenanceSchedules": [
+                {
+                    "StartAt": datetime(2015, 1, 1),
+                    "Duration": {"Value": 123, "Unit": "HOURS"},
+                    "CronExpressionForRecurrence": "string",
+                },
+            ],
+        },
+    )
+
+
+def test_restjson_awslambda_invoke_with_botocore():
+    _botocore_parser_integration_test(
+        service="lambda",
+        action="Invoke",
+        headers={},
+        expected={"FunctionName": "test-function", "Payload": ""},
+        FunctionName="test-function",
     )
 
 
@@ -489,6 +597,47 @@ def test_ec2_parser_ec2_with_botocore():
                 ],
             },
         ],
+    )
+
+
+def test_query_parser_path_params_with_slashes():
+    parser = RestJSONRequestParser(load_service("qldb"))
+    resource_arn = "arn:aws:qldb:eu-central-1:000000000000:ledger/c-c67c827a"
+    request = HttpRequest(
+        body=b"",
+        method="GET",
+        headers={},
+        path=f"/tags/{resource_arn}",
+    )
+    operation, params = parser.parse(request)
+    assert operation.name == "ListTagsForResource"
+    assert params == {"ResourceArn": resource_arn}
+
+
+def test_parse_cloudtrail_with_botocore():
+    _botocore_parser_integration_test(
+        service="cloudtrail",
+        action="DescribeTrails",
+        trailNameList=["t1"],
+    )
+
+
+def test_parse_opensearch_conflicting_request_uris():
+    """
+    Tests if the operation detection works with conflicting regular expressions:
+    - OpenSearch's DescribeDomain (/2021-01-01/opensearch/domain/{DomainName})
+    - OpenSearch's DescribeDomainConfig (/2021-01-01/opensearch/domain/{DomainName}/config)
+    Since the path parameters are greedy (they might contain slashes), "better" matches need to be preferred.
+    """
+    _botocore_parser_integration_test(
+        service="opensearch",
+        action="DescribeDomainConfig",
+        DomainName="test-domain",
+    )
+    _botocore_parser_integration_test(
+        service="opensearch",
+        action="DescribeDomain",
+        DomainName="test-domain",
     )
 
 

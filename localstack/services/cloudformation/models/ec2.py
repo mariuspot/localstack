@@ -12,12 +12,16 @@ class EC2RouteTable(GenericBaseModel):
 
     def fetch_state(self, stack_name, resources):
         client = aws_stack.connect_to_service("ec2")
-        route_tables = client.describe_route_tables(
-            Filters=[
-                {"Name": "vpc-id", "Values": [self.props["VpcId"]]},
-                {"Name": "association.main", "Values": ["false"]},
-            ]
-        )["RouteTables"]
+        tags_filters = map(
+            lambda tag: {"Name": f"tag:{tag.get('Key')}", "Values": [tag.get("Value")]},
+            self.props.get("Tags") or [],
+        )
+        filters = [
+            {"Name": "vpc-id", "Values": [self.props["VpcId"]]},
+            {"Name": "association.main", "Values": ["false"]},
+        ]
+        filters.extend(tags_filters)
+        route_tables = client.describe_route_tables(Filters=filters)["RouteTables"]
         return (route_tables or [None])[0]
 
     def get_physical_resource_id(self, attribute=None, **kwargs):
@@ -143,9 +147,12 @@ class EC2SubnetRouteTableAssociation(GenericBaseModel):
         gw_id = self.resolve_refs_recursively(stack_name, props.get("GatewayId"), resources)
         route_tables = client.describe_route_tables()["RouteTables"]
         route_table = ([t for t in route_tables if t["RouteTableId"] == table_id] or [None])[0]
+        subnet_id = self.resolve_refs_recursively(stack_name, props.get("SubnetId"), resources)
         if route_table:
             associations = route_table.get("Associations", [])
             association = [a for a in associations if a.get("GatewayId") == gw_id]
+            if subnet_id:
+                association = [a for a in associations if a.get("SubnetId") == subnet_id]
             return (association or [None])[0]
 
     def get_physical_resource_id(self, attribute=None, **kwargs):
@@ -161,7 +168,11 @@ class EC2SubnetRouteTableAssociation(GenericBaseModel):
                     "RouteTableId": "RouteTableId",
                     "SubnetId": "SubnetId",
                 },
-            }
+            },
+            "delete": {
+                "function": "disassociate_route_table",
+                "parameters": {"AssociationId": "RouteTableAssociationId"},
+            },
         }
 
 
@@ -327,6 +338,13 @@ class EC2VPC(GenericBaseModel):
                     ]
                 )
                 for rt in resp["RouteTables"]:
+                    for assoc in rt.get("Associations", []):
+                        # skipping Main association (upstream moto includes default association that cannot be deleted)
+                        if assoc.get("Main"):
+                            continue
+                        ec2_client.disassociate_route_table(
+                            AssociationId=assoc["RouteTableAssociationId"]
+                        )
                     ec2_client.delete_route_table(RouteTableId=rt["RouteTableId"])
 
         return {
@@ -410,10 +428,13 @@ class EC2Instance(GenericBaseModel):
         groups = props.get("SecurityGroups", props.get("SecurityGroupIds"))
 
         client = aws_stack.connect_to_service("ec2")
+        kwargs = {}
+        if groups:
+            kwargs["Groups"] = groups
         client.modify_instance_attribute(
-            Groups=groups,
             InstanceId=instance_id,
             InstanceType={"Value": props["InstanceType"]},
+            **kwargs,
         )
         return self._get_state(client)
 

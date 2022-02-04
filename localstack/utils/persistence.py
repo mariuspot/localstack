@@ -12,7 +12,7 @@ import requests
 from six import add_metaclass
 
 from localstack import config, constants
-from localstack.config import DATA_DIR, is_env_not_false, is_env_true
+from localstack.config import is_env_not_false, is_env_true
 from localstack.services.generic_proxy import ProxyListener
 from localstack.utils.aws import aws_stack
 from localstack.utils.bootstrap import is_api_enabled
@@ -50,9 +50,9 @@ class PersistingProxyListener(ProxyListener):
 
     SKIP_PERSISTENCE_TARGET_METHOD_REGEX = re.compile(r".*\.List|.*\.Describe|.*\.Get")
 
-    def return_response(self, method, path, data, headers, response, request_handler=None):
+    def return_response(self, method, path, data, headers, response):
         res = super(PersistingProxyListener, self).return_response(
-            method, path, data, headers, response, request_handler
+            method, path, data, headers, response
         )
 
         if self.should_persist(method, path, data, headers, response):
@@ -99,8 +99,12 @@ def should_record(method):
     return method in ["PUT", "POST", "DELETE", "PATCH"]
 
 
+# TODO: deprecated - to be disabled in future release
 def record(api, method=None, path=None, data=None, headers=None, response=None, request=None):
     """Record a given API call to a persistent file on disk"""
+    if not config.LEGACY_PERSISTENCE:
+        return
+
     file_path = get_file_path(api)
     if CURRENTLY_REPLAYING or not file_path:
         return
@@ -123,7 +127,7 @@ def record(api, method=None, path=None, data=None, headers=None, response=None, 
                 try:
                     request_data = to_bytes(request_data)
                 except Exception as ex:
-                    LOG.warning("Unable to call to_bytes: %s" % ex)
+                    LOG.warning("Unable to call to_bytes: %s", ex)
                 request_data = to_str(base64.b64encode(request_data))
             return request_data
 
@@ -170,7 +174,11 @@ def replay_command(command):
     return response
 
 
+# TODO: deprecated - to be disabled in future release
 def replay(api):
+    if not config.LEGACY_PERSISTENCE:
+        return
+
     file_path = get_file_path(api)
     if not file_path:
         return
@@ -186,7 +194,7 @@ def replay(api):
     finally:
         CURRENTLY_REPLAYING.pop(0)
     if count:
-        LOG.info("Restored %s API calls from persistent file: %s" % (count, file_path))
+        LOG.info("Restored %s API calls from persistent file: %s", count, file_path)
 
 
 def restore_persisted_data(apis):
@@ -202,7 +210,7 @@ def restore_persisted_data(apis):
 
 
 def is_persistence_enabled():
-    return bool(config.DATA_DIR)
+    return bool(config.dirs.data)
 
 
 def is_persistence_restored():
@@ -219,7 +227,7 @@ class StartupInfo(NamedTuple):
 def save_startup_info():
     from localstack_ext.constants import VERSION as LOCALSTACK_EXT_VERSION
 
-    file_path = os.path.join(DATA_DIR, STARTUP_INFO_FILE)
+    file_path = os.path.join(config.dirs.data, STARTUP_INFO_FILE)
 
     info = StartupInfo(
         timestamp=datetime.datetime.now().isoformat(),
@@ -239,7 +247,7 @@ def save_startup_info():
 
 def _append_startup_info(file_path, startup_info: StartupInfo):
     if not os.path.exists(file_path):
-        infos = list()
+        infos = []
     else:
         with open(file_path, "r") as fd:
             infos = json.load(fd)
@@ -257,9 +265,9 @@ def _append_startup_info(file_path, startup_info: StartupInfo):
 def get_file_path(api, create=True):
     if api not in API_FILE_PATHS:
         API_FILE_PATHS[api] = False
-        if not DATA_DIR:
+        if not config.dirs.data:
             return False
-        file_path = API_FILE_PATTERN.format(data_dir=DATA_DIR, api=api)
+        file_path = API_FILE_PATTERN.format(data_dir=config.dirs.data, api=api)
         if create and not os.path.exists(file_path):
             with open(file_path, "a"):
                 os.utime(file_path, None)

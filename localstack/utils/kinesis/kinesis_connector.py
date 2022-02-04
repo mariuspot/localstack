@@ -2,14 +2,14 @@
 
 import logging
 import os
+import queue
 import re
 import subprocess
 import tempfile
 import threading
+from urllib.parse import urlparse
 
 from amazon_kclpy import kcl
-from six.moves import queue as Queue
-from six.moves.urllib.parse import urlparse
 
 from localstack import config
 from localstack.config import USE_SSL
@@ -111,7 +111,7 @@ class KinesisProcessor(kcl.RecordProcessorBase):
         try:
             retry(do_checkpoint, retries=CHECKPOINT_RETRIES, sleep=CHECKPOINT_SLEEP_SECS)
         except Exception as e:
-            LOGGER.warning("Unable to checkpoint Kinesis after retries: %s" % e)
+            LOGGER.warning("Unable to checkpoint Kinesis after retries: %s", e)
 
     def should_update_sequence(self, sequence_number, sub_sequence_number):
         return (
@@ -201,9 +201,11 @@ class OutputReaderThread(FuncThread):
                 if re.match(subscriber.regex, line):
                     subscriber.update(line)
             except Exception as e:
-                LOGGER.warning("Unable to notify log subscriber: %s" % e)
+                LOGGER.warning("Unable to notify log subscriber: %s", e)
 
     def start_reading(self, params):
+        # FIXME: consider using common.FileListener
+
         for line in self._tail(params["file"]):
             # notify subscribers
             self.notify_subscribers(line)
@@ -258,8 +260,8 @@ class KclStartedLogListener(KclLogListener):
         super(KclStartedLogListener, self).__init__(regex=regex)
         # Semaphore.acquire does not provide timeout parameter, so we
         # use a Queue here which provides the required functionality
-        self.sync_init = Queue.Queue(0)
-        self.sync_take_shard = Queue.Queue(0)
+        self.sync_init = queue.Queue(0)
+        self.sync_take_shard = queue.Queue(0)
 
     def update(self, log_line):
         if re.match(self.regex_init, log_line):
@@ -276,8 +278,10 @@ def get_stream_info(
     env=None,
     endpoint_url=None,
     ddb_lease_table_suffix=None,
-    env_vars={},
+    env_vars=None,
 ):
+    if env_vars is None:
+        env_vars = {}
     if not ddb_lease_table_suffix:
         ddb_lease_table_suffix = DEFAULT_DDB_LEASE_TABLE_SUFFIX
     # construct stream info
@@ -299,7 +303,7 @@ def get_stream_info(
     if aws_stack.is_local_env(env):
         stream_info["conn_kwargs"] = {
             "host": LOCALHOST,
-            "port": config.PORT_KINESIS,
+            "port": config.service_port("kinesis"),
             "is_secure": bool(USE_SSL),
         }
     if endpoint_url:
@@ -317,14 +321,20 @@ def start_kcl_client_process(
     listener_script,
     log_file=None,
     env=None,
-    configs={},
+    configs=None,
     endpoint_url=None,
     ddb_lease_table_suffix=None,
-    env_vars={},
+    env_vars=None,
     region_name=None,
     kcl_log_level=DEFAULT_KCL_LOG_LEVEL,
-    log_subscribers=[],
+    log_subscribers=None,
 ):
+    if configs is None:
+        configs = {}
+    if env_vars is None:
+        env_vars = {}
+    if log_subscribers is None:
+        log_subscribers = []
     env = aws_stack.get_environment(env)
     # make sure to convert stream ARN to stream name
     stream_name = aws_stack.kinesis_stream_name(stream_name)
@@ -380,8 +390,8 @@ def start_kcl_client_process(
     kwargs = {"metricsLevel": "NONE", "initialPositionInStream": "LATEST"}
     # set parameters for local connection
     if aws_stack.is_local_env(env):
-        kwargs["kinesisEndpoint"] = "%s:%s" % (LOCALHOST, config.PORT_KINESIS)
-        kwargs["dynamodbEndpoint"] = "%s:%s" % (LOCALHOST, config.PORT_DYNAMODB)
+        kwargs["kinesisEndpoint"] = f"{LOCALHOST}:{config.service_port('kinesis')}"
+        kwargs["dynamodbEndpoint"] = f"{LOCALHOST}:{config.service_port('dynamodb')}"
         kwargs["kinesisProtocol"] = get_service_protocol()
         kwargs["dynamodbProtocol"] = get_service_protocol()
         kwargs["disableCertChecking"] = "true"
@@ -475,12 +485,12 @@ def listen_to_kinesis(
     events_file=None,
     endpoint_url=None,
     log_file=None,
-    configs={},
+    configs=None,
     env=None,
     ddb_lease_table_suffix=None,
-    env_vars={},
+    env_vars=None,
     kcl_log_level=DEFAULT_KCL_LOG_LEVEL,
-    log_subscribers=[],
+    log_subscribers=None,
     wait_until_started=False,
     fh_d_stream=None,
     region_name=None,
@@ -490,6 +500,12 @@ def listen_to_kinesis(
     and receive events in a listener function. A KCL client process is
     automatically started in the background.
     """
+    if configs is None:
+        configs = {}
+    if env_vars is None:
+        env_vars = {}
+    if log_subscribers is None:
+        log_subscribers = []
     env = aws_stack.get_environment(env)
     if not events_file:
         events_file = EVENTS_FILE_PATTERN.replace("*", short_uid())

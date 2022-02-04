@@ -1,6 +1,8 @@
+import dataclasses
+import json
 import logging
 import os
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import boto3
 import botocore.config
@@ -9,26 +11,37 @@ import pytest
 from localstack.utils import testutil
 from localstack.utils.aws import aws_stack
 from localstack.utils.aws.aws_stack import create_dynamodb_table
-from localstack.utils.common import is_alpine, short_uid
+from localstack.utils.common import ensure_list, load_file, poll_condition
+from localstack.utils.common import safe_requests as requests
+from localstack.utils.common import short_uid
+from localstack.utils.generic.wait_utils import wait_until
+from localstack.utils.testutil import start_http_server
+from tests.integration.cloudformation.utils import render_template, template_path
 
 if TYPE_CHECKING:
+    from mypy_boto3_acm import ACMClient
     from mypy_boto3_apigateway import APIGatewayClient
     from mypy_boto3_cloudformation import CloudFormationClient
+    from mypy_boto3_cloudwatch import CloudWatchClient
     from mypy_boto3_dynamodb import DynamoDBClient
     from mypy_boto3_es import ElasticsearchServiceClient
     from mypy_boto3_events import EventBridgeClient
+    from mypy_boto3_firehose import FirehoseClient
     from mypy_boto3_iam import IAMClient
     from mypy_boto3_kinesis import KinesisClient
     from mypy_boto3_kms import KMSClient
     from mypy_boto3_lambda import LambdaClient
     from mypy_boto3_logs import CloudWatchLogsClient
+    from mypy_boto3_opensearch import OpenSearchServiceClient
     from mypy_boto3_s3 import S3Client
     from mypy_boto3_secretsmanager import SecretsManagerClient
     from mypy_boto3_ses import SESClient
     from mypy_boto3_sns import SNSClient
+    from mypy_boto3_sns.type_defs import GetTopicAttributesResponseTypeDef
     from mypy_boto3_sqs import SQSClient
     from mypy_boto3_ssm import SSMClient
     from mypy_boto3_stepfunctions import SFNClient
+    from mypy_boto3_sts import STSClient
 
 LOG = logging.getLogger(__name__)
 
@@ -44,7 +57,7 @@ def _client(service):
         if os.environ.get("TEST_DISABLE_RETRIES_AND_TIMEOUTS")
         else None
     )
-    return aws_stack.connect_to_service(service, config=config)
+    return aws_stack.create_external_boto_client(service, config=config)
 
 
 @pytest.fixture(scope="class")
@@ -128,13 +141,38 @@ def ses_client() -> "SESClient":
 
 
 @pytest.fixture(scope="class")
+def acm_client() -> "ACMClient":
+    return _client("acm")
+
+
+@pytest.fixture(scope="class")
 def es_client() -> "ElasticsearchServiceClient":
     return _client("es")
 
 
+@pytest.fixture(scope="class")
+def opensearch_client() -> "OpenSearchServiceClient":
+    return _client("opensearch")
+
+
+@pytest.fixture(scope="class")
+def firehose_client() -> "FirehoseClient":
+    return _client("firehose")
+
+
+@pytest.fixture(scope="class")
+def cloudwatch_client() -> "CloudWatchClient":
+    return _client("cloudwatch")
+
+
+@pytest.fixture(scope="class")
+def sts_client() -> "STSClient":
+    return _client("sts")
+
+
 @pytest.fixture
 def dynamodb_create_table(dynamodb_client):
-    tables = list()
+    tables = []
 
     def factory(**kwargs):
         kwargs["client"] = dynamodb_client
@@ -161,7 +199,7 @@ def dynamodb_create_table(dynamodb_client):
 
 @pytest.fixture
 def s3_create_bucket(s3_client):
-    buckets = list()
+    buckets = []
 
     def factory(**kwargs) -> str:
         if "Bucket" not in kwargs:
@@ -188,7 +226,7 @@ def s3_bucket(s3_create_bucket) -> str:
 
 @pytest.fixture
 def sqs_create_queue(sqs_client):
-    queue_urls = list()
+    queue_urls = []
 
     def factory(**kwargs):
         if "QueueName" not in kwargs:
@@ -216,13 +254,51 @@ def sqs_queue(sqs_create_queue):
 
 
 @pytest.fixture
-def sns_topic(sns_client):
-    # TODO: add fixture factories
-    topic_name = "test-topic-%s" % short_uid()
-    response = sns_client.create_topic(Name=topic_name)
-    topic_arn = response["TopicArn"]
-    yield sns_client.get_topic_attributes(TopicArn=topic_arn)
-    sns_client.delete_topic(TopicArn=topic_arn)
+def sns_create_topic(sns_client):
+    topic_arns = []
+
+    def _create_topic(**kwargs):
+        if "Name" not in kwargs:
+            kwargs["Name"] = "test-topic-%s" % short_uid()
+        response = sns_client.create_topic(**kwargs)
+        topic_arns.append(response["TopicArn"])
+        return response
+
+    yield _create_topic
+
+    for topic_arn in topic_arns:
+        try:
+            sns_client.delete_topic(TopicArn=topic_arn)
+        except Exception as e:
+            LOG.debug("error cleaning up topic %s: %s", topic_arn, e)
+
+
+@pytest.fixture
+def sns_topic(sns_client, sns_create_topic) -> "GetTopicAttributesResponseTypeDef":
+    topic_arn = sns_create_topic()["TopicArn"]
+    return sns_client.get_topic_attributes(TopicArn=topic_arn)
+
+
+@pytest.fixture
+def kinesis_create_stream(kinesis_client):
+    stream_names = []
+
+    def _create_stream(**kwargs):
+        if "StreamName" not in kwargs:
+            kwargs["StreamName"] = f"test-stream-{short_uid()}"
+        if "ShardCount" not in kwargs:
+            kwargs["ShardCount"] = 2
+        kinesis_client.create_stream(**kwargs)
+        stream_names.append(kwargs["StreamName"])
+        return kwargs["StreamName"]
+
+    yield _create_stream
+
+    for stream_name in stream_names:
+        try:
+            kinesis_client.delete_stream(StreamName=stream_name)
+        except Exception as e:
+            LOG.debug("error cleaning up kinesis stream %s: %s", stream_name, e)
 
 
 @pytest.fixture
@@ -244,10 +320,75 @@ def kms_grant_and_key(kms_client, kms_key):
     ]
 
 
+@pytest.fixture
+def opensearch_create_domain(opensearch_client):
+    domains = []
+
+    def factory(**kwargs) -> str:
+        if "DomainName" not in kwargs:
+            kwargs["DomainName"] = f"test-domain-{short_uid()}"
+
+        opensearch_client.create_domain(**kwargs)
+
+        def finished_processing():
+            status = opensearch_client.describe_domain(DomainName=kwargs["DomainName"])[
+                "DomainStatus"
+            ]
+            return status["Processing"] is False
+
+        assert poll_condition(
+            finished_processing, timeout=120
+        ), f"could not start domain: {kwargs['DomainName']}"
+
+        domains.append(kwargs["DomainName"])
+        return kwargs["DomainName"]
+
+    yield factory
+
+    # cleanup
+    for domain in domains:
+        try:
+            opensearch_client.delete_domain(DomainName=domain)
+        except Exception as e:
+            LOG.debug("error cleaning up domain %s: %s", domain, e)
+
+
+@pytest.fixture
+def opensearch_domain(opensearch_create_domain) -> str:
+    return opensearch_create_domain()
+
+
+@pytest.fixture
+def opensearch_endpoint(opensearch_client, opensearch_domain) -> str:
+    status = opensearch_client.describe_domain(DomainName=opensearch_domain)["DomainStatus"]
+    assert "Endpoint" in status
+    return f"https://{status['Endpoint']}"
+
+
+@pytest.fixture
+def opensearch_document_path(opensearch_client, opensearch_endpoint):
+    document = {
+        "first_name": "Boba",
+        "last_name": "Fett",
+        "age": 41,
+        "about": "I'm just a simple man, trying to make my way in the universe.",
+        "interests": ["mandalorian armor", "tusken culture"],
+    }
+    document_path = f"{opensearch_endpoint}/bounty/hunters/1"
+    response = requests.put(
+        document_path,
+        data=json.dumps(document),
+        headers={"content-type": "application/json", "Accept-encoding": "identity"},
+    )
+    assert response.status_code == 201, f"could not create document at: {document_path}"
+    return document_path
+
+
 # Cleanup fixtures
 @pytest.fixture
 def cleanup_stacks(cfn_client):
     def _cleanup_stacks(stacks: List[str]) -> None:
+        stacks = ensure_list(stacks)
         for stack in stacks:
             try:
                 cfn_client.delete_stack(StackName=stack)
@@ -260,6 +401,7 @@ def cleanup_stacks(cfn_client):
 @pytest.fixture
 def cleanup_changesets(cfn_client):
     def _cleanup_changesets(changesets: List[str]) -> None:
+        changesets = ensure_list(changesets)
         for cs in changesets:
             try:
                 cfn_client.delete_change_set(ChangeSetName=cs)
@@ -270,6 +412,82 @@ def cleanup_changesets(cfn_client):
 
 
 # Helpers for Cfn
+
+
+@dataclasses.dataclass(frozen=True)
+class DeployResult:
+    change_set_id: str
+    stack_id: str
+    stack_name: str
+    change_set_name: str
+    outputs: Dict[str, str]
+
+
+@pytest.fixture
+def deploy_cfn_template(
+    cfn_client,
+    lambda_client,
+    cleanup_stacks,
+    cleanup_changesets,
+    is_change_set_created_and_available,
+    is_change_set_finished,
+):
+    stack_name = f"stack-{short_uid()}"
+    state = []
+
+    def _deploy(
+        *,
+        is_update: Optional[bool] = False,
+        template: Optional[str] = None,
+        template_file_name: Optional[str] = None,
+        template_mapping: Optional[Dict[str, any]] = None,
+        parameters: Optional[Dict[str, str]] = None,
+    ) -> DeployResult:
+        change_set_name = f"change-set-{short_uid()}"
+
+        if template_file_name is not None and os.path.exists(template_path(template_file_name)):
+            template = load_file(template_path(template_file_name))
+        template_rendered = render_template(template, **(template_mapping or {}))
+
+        response = cfn_client.create_change_set(
+            StackName=stack_name,
+            ChangeSetName=change_set_name,
+            TemplateBody=template_rendered,
+            ChangeSetType=("UPDATE" if is_update else "CREATE"),
+            Parameters=[
+                {
+                    "ParameterKey": k,
+                    "ParameterValue": v,
+                }
+                for (k, v) in (parameters or {}).items()
+            ],
+        )
+        change_set_id = response["Id"]
+        stack_id = response["StackId"]
+
+        assert wait_until(is_change_set_created_and_available(change_set_id))
+        cfn_client.execute_change_set(ChangeSetName=change_set_id)
+        assert wait_until(is_change_set_finished(change_set_id))
+
+        outputs = cfn_client.describe_stacks(StackName=stack_id)["Stacks"][0]["Outputs"]
+
+        mapped_outputs = {o["OutputKey"]: o["OutputValue"] for o in outputs}
+
+        state.append({"stack_id": stack_id, "change_set_id": change_set_id})
+        return DeployResult(change_set_id, stack_id, stack_name, change_set_name, mapped_outputs)
+
+    yield _deploy
+
+    for entry in state:
+        entry_stack_id = entry.get("stack_id")
+        entry_change_set_id = entry.get("change_set_id")
+        try:
+            entry_change_set_id and cleanup_changesets(entry_change_set_id)
+            entry_stack_id and cleanup_stacks(entry_stack_id)
+        except Exception as e:
+            LOG.debug(
+                f"Failed cleaning up change set {entry_change_set_id=} and stack {entry_stack_id=}: {e}"
+            )
 
 
 @pytest.fixture
@@ -329,7 +547,7 @@ def is_change_set_finished(cfn_client):
 
 @pytest.fixture
 def create_lambda_function(lambda_client: "LambdaClient"):
-    lambda_arns = list()
+    lambda_arns = []
 
     def _create_lambda_function(*args, **kwargs):
         # TODO move create function logic here to use lambda_client fixture
@@ -372,7 +590,14 @@ def create_secret(secretsmanager_client):
         secretsmanager_client.delete_secret(SecretId=item)
 
 
-only_in_alpine = pytest.mark.skipif(
-    not is_alpine(),
-    reason="test only applicable if run in alpine",
+only_localstack = pytest.mark.skipif(
+    os.environ.get("TEST_TARGET") == "AWS_CLOUD",
+    reason="test only applicable if run against localstack",
 )
+
+
+@pytest.fixture
+def tmp_http_server():
+    test_port, invocations, proxy = start_http_server()
+    yield test_port, invocations, proxy
+    proxy.stop()

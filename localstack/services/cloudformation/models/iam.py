@@ -1,8 +1,6 @@
 import json
 import logging
 
-from moto.iam.models import Role as MotoRole
-
 from localstack.services.awslambda.lambda_api import IAM_POLICY_VERSION
 from localstack.services.cloudformation.deployment_utils import (
     PLACEHOLDER_AWS_NO_VALUE,
@@ -156,7 +154,7 @@ class IAMUser(GenericBaseModel):
         }
 
 
-class IAMRole(GenericBaseModel, MotoRole):
+class IAMRole(GenericBaseModel):
     @staticmethod
     def cloudformation_type():
         return "AWS::IAM::Role"
@@ -214,6 +212,11 @@ class IAMRole(GenericBaseModel, MotoRole):
     @staticmethod
     def _post_create(resource_id, resources, resource_type, func, stack_name):
         """attaches managed policies from the template to the role"""
+        from localstack.utils.cloudformation.template_deployer import (
+            find_stack,
+            resolve_refs_recursively,
+        )
+
         iam = aws_stack.connect_to_service("iam")
         resource = resources[resource_id]
         props = resource["Properties"]
@@ -223,6 +226,9 @@ class IAMRole(GenericBaseModel, MotoRole):
         policy_arns = props.get("ManagedPolicyArns", [])
         for arn in policy_arns:
             iam.attach_role_policy(RoleName=role_name, PolicyArn=arn)
+
+        # TODO: to be removed once we change the method signature to pass in the stack object directly!
+        stack = find_stack(stack_name)
 
         # add inline policies
         inline_policies = props.get("Policies", [])
@@ -234,12 +240,15 @@ class IAMRole(GenericBaseModel, MotoRole):
                 continue
             if not isinstance(policy, dict):
                 LOG.info(
-                    'Invalid format of policy for IAM role "%s": %s'
-                    % (props.get("RoleName"), policy)
+                    'Invalid format of policy for IAM role "%s": %s', props.get("RoleName"), policy
                 )
                 continue
             pol_name = policy.get("PolicyName")
+
+            # get policy document - make sure we're resolving references in the policy doc
             doc = dict(policy["PolicyDocument"])
+            doc = resolve_refs_recursively(stack, doc)
+
             doc["Version"] = doc.get("Version") or IAM_POLICY_VERSION
             statements = ensure_list(doc["Statement"])
             for statement in statements:

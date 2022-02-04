@@ -6,12 +6,13 @@ import re
 import time
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple, Union
+from urllib.parse import urljoin
 
+import pytz
 import requests
 from flask import Response as FlaskResponse
 from moto.apigateway.models import apigateway_backends
 from requests.models import Response
-from six.moves.urllib_parse import urljoin
 
 from localstack import config
 from localstack.constants import (
@@ -55,13 +56,23 @@ from localstack.utils.aws import aws_responses, aws_stack
 from localstack.utils.aws.aws_responses import (
     LambdaResponse,
     flask_to_requests_response,
+    parse_query_string,
     request_response_stream,
     requests_response,
 )
 from localstack.utils.aws.request_context import MARKER_APIGW_REQUEST_REGION, THREAD_LOCAL
-from localstack.utils.common import camel_to_snake_case, json_safe, long_uid, to_bytes, to_str
+from localstack.utils.common import (
+    camel_to_snake_case,
+    json_safe,
+    long_uid,
+    to_bytes,
+    to_str,
+    try_json,
+)
 
 # set up logger
+from localstack.utils.http_utils import add_query_params_to_url
+
 LOG = logging.getLogger(__name__)
 
 # target ARN patterns
@@ -77,6 +88,8 @@ HOST_REGEX_EXECUTE_API = (
     r"(?:.*://)?([a-zA-Z0-9-]+)\.execute-api\.(%s|([^\.]+)\.amazonaws\.com)(.*)"
     % LOCALHOST_HOSTNAME
 )
+
+REQUEST_TIME_DATE_FORMAT = "%d/%b/%Y:%H:%M:%S %z"
 
 
 class ApiGatewayVersion(Enum):
@@ -172,6 +185,11 @@ class ApiInvocationContext:
         """Set a custom invocation path with query string (used to handle "../_user_request_/.." paths)."""
         self._path_with_query_string = new_path
 
+    def query_params(self) -> Dict:
+        """Extract the query parameters from the target URL or path in this request context."""
+        query_string = self.path_with_query_string.partition("?")[2]
+        return parse_query_string(query_string)
+
     @property
     def integration_uri(self) -> Optional[str]:
         integration = self.integration or {}
@@ -192,6 +210,14 @@ class ApiInvocationContext:
             if self.auth_info.get("identity") is None:
                 self.auth_info["identity"] = {}
             return self.auth_info["identity"]
+
+    def is_websocket_request(self):
+        upgrade_header = str(self.headers.get("upgrade") or "")
+        return upgrade_header.lower() == "websocket"
+
+    def is_v1(self):
+        """Whether this is an API Gateway v1 request"""
+        return self.apigw_version == ApiGatewayVersion.V1
 
 
 class ProxyListenerApiGateway(ProxyListener):
@@ -240,6 +266,7 @@ class ProxyListenerApiGateway(ProxyListener):
                 "headers": dict(result.headers),
             }
             return result
+
         return True
 
     def return_response(self, method, path, data, headers, response):
@@ -342,8 +369,10 @@ def update_content_length(response: Response):
         response.headers["Content-Length"] = str(len(response.content))
 
 
-def apply_request_parameter(uri: str, integration: Dict[str, Any], path_params: Dict[str, str]):
-    request_parameters = integration.get("requestParameters", None)
+def apply_request_parameters(
+    uri: str, integration: Dict[str, Any], path_params: Dict[str, str], query_params: Dict[str, str]
+):
+    request_parameters = integration.get("requestParameters")
     uri = uri or integration.get("uri") or integration.get("integrationUri") or ""
     if request_parameters:
         for key in path_params:
@@ -352,18 +381,34 @@ def apply_request_parameter(uri: str, integration: Dict[str, Any], path_params: 
             request_param_value = f"method.request.path.{key}"
             if request_parameters.get(request_param_key, None) == request_param_value:
                 uri = uri.replace(f"{{{key}}}", path_params[key])
-    return uri
+
+    if integration.get("type") != "HTTP_PROXY" and request_parameters:
+        for key in query_params.copy():
+            request_query_key = f"integration.request.querystring.{key}"
+            request_param_val = f"method.request.querystring.{key}"
+            if request_parameters.get(request_query_key, None) != request_param_val:
+                query_params.pop(key)
+
+    return add_query_params_to_url(uri, query_params)
 
 
 def apply_template(
     integration: Dict[str, Any],
     req_res_type: str,
     data: InvocationPayload,
-    path_params={},
-    query_params={},
-    headers={},
-    context={},
+    path_params=None,
+    query_params=None,
+    headers=None,
+    context=None,
 ):
+    if path_params is None:
+        path_params = {}
+    if query_params is None:
+        query_params = {}
+    if headers is None:
+        headers = {}
+    if context is None:
+        context = {}
     integration_type = integration.get("type") or integration.get("integrationType")
     if integration_type in ["HTTP", "AWS"]:
         # apply custom request template
@@ -372,6 +417,19 @@ def apply_template(
         if template:
             variables = {"context": context or {}}
             input_ctx = {"body": data}
+            # little trick to flatten the input context so velocity templates
+            # work from the root.
+            # orig - { "body": '{"action": "$default","message":"foobar"}'
+            # after - {
+            #   "body": '{"action": "$default","message":"foobar"}',
+            #   "action": "$default",
+            #   "message": "foobar"
+            # }
+            if data:
+                dict_pack = try_json(data)
+                if isinstance(dict_pack, dict):
+                    for k, v in dict_pack.items():
+                        input_ctx.update({k: v})
 
             def _params(name=None):
                 # See https://docs.aws.amazon.com/apigateway/latest/developerguide/
@@ -399,7 +457,7 @@ def apply_response_parameters(invocation_context: ApiInvocationContext):
     return_code = str(response.status_code)
     if return_code not in entries:
         if len(entries) > 1:
-            LOG.info("Found multiple integration response status codes: %s" % entries)
+            LOG.info("Found multiple integration response status codes: %s", entries)
             return response
         return_code = entries[0]
     response_params = int_responses[return_code].get("responseParameters", {})
@@ -421,6 +479,10 @@ def set_api_id_stage_invocation_path(
         invocation_context.path_with_query_string,
     )
     if all(values):
+        return invocation_context
+
+    # skip if this is a websocket request
+    if invocation_context.is_websocket_request():
         return invocation_context
 
     path = invocation_context.path
@@ -504,7 +566,11 @@ def invoke_rest_api(invocation_context: ApiInvocationContext):
     integrations = resource.get("resourceMethods", {})
     integration = integrations.get(method, {})
     if not integration:
-        integration = integrations.get("ANY", {})
+        # HttpMethod: '*'
+        # ResourcePath: '/*' - produces 'X-AMAZON-APIGATEWAY-ANY-METHOD'
+        integration = integrations.get("ANY", {}) or integrations.get(
+            "X-AMAZON-APIGATEWAY-ANY-METHOD", {}
+        )
     integration = integration.get("methodIntegration")
     if not integration:
         if method == "OPTIONS" and "Origin" in headers:
@@ -526,8 +592,7 @@ def invoke_rest_api(invocation_context: ApiInvocationContext):
     invocation_context.response_templates = response_templates
     invocation_context.integration = integration
 
-    result = invoke_rest_api_integration(invocation_context)
-    return result
+    return invoke_rest_api_integration(invocation_context)
 
 
 def invoke_rest_api_integration(invocation_context: ApiInvocationContext):
@@ -544,6 +609,8 @@ def invoke_rest_api_integration(invocation_context: ApiInvocationContext):
         return make_error_response(msg, 400)
 
 
+# TODO: refactor this to have a class per integration type to make it easy to
+# test the encapsulated logic
 def invoke_rest_api_integration_backend(
     invocation_context: ApiInvocationContext, integration: Dict
 ):
@@ -595,12 +662,12 @@ def invoke_rest_api_integration_backend(
                 data_str = base64.b64encode(data_str)
                 is_base64_encoded = True
             except Exception as e:
-                LOG.warning("Unable to convert API Gateway payload to str: %s" % (e))
+                LOG.warning("Unable to convert API Gateway payload to str: %s", (e))
                 pass
 
             # Sample request context:
             # https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-create-api-as-simple-proxy-for-lambda.html#api-gateway-create-api-as-simple-proxy-for-lambda-test
-            request_context = get_lambda_event_request_context(invocation_context)
+            request_context = get_event_request_context(invocation_context)
             stage_variables = (
                 get_stage_variables(api_id, stage)
                 if not is_test_invoke_method(method, path)
@@ -649,7 +716,7 @@ def invoke_rest_api_integration_backend(
                             body_bytes = base64.b64decode(body_bytes)
                         response._content = body_bytes
                 except Exception as e:
-                    LOG.warning("Couldn't set Lambda response content: %s" % e)
+                    LOG.warning("Couldn't set Lambda response content: %s", e)
                     response._content = "{}"
                 update_content_length(response)
                 response.multi_value_headers = parsed_result.get("multiValueHeaders") or {}
@@ -689,7 +756,7 @@ def invoke_rest_api_integration_backend(
             headers = aws_stack.mock_aws_request_headers(service="kinesis")
             headers["X-Amz-Target"] = target
             result = common.make_http_request(
-                url=config.TEST_KINESIS_URL, method="POST", data=new_data, headers=headers
+                url=config.service_url("kinesis"), method="POST", data=new_data, headers=headers
             )
             # apply response template
             result = apply_request_response_templates(
@@ -699,7 +766,6 @@ def invoke_rest_api_integration_backend(
 
         elif "states:action/" in uri:
             action = uri.split("/")[-1]
-            payload = {}
 
             if APPLICATION_JSON in integration.get("requestTemplates", {}):
                 payload = apply_request_response_templates(
@@ -711,6 +777,9 @@ def invoke_rest_api_integration_backend(
             else:
                 payload = json.loads(data.decode("utf-8"))
             client = aws_stack.connect_to_service("stepfunctions")
+
+            if isinstance(payload.get("input"), dict):
+                payload["input"] = json.dumps(payload["input"])
 
             # Hot fix since step functions local package responses: Unsupported Operation: 'StartSyncExecution'
             method_name = (
@@ -724,9 +793,7 @@ def invoke_rest_api_integration_backend(
                 LOG.error(msg)
                 return make_error_response(msg, 400)
 
-            result = method(
-                **payload,
-            )
+            result = method(**payload)
             result = json_safe({k: result[k] for k in result if k not in "ResponseMetadata"})
             response = requests_response(
                 content=result,
@@ -783,14 +850,18 @@ def invoke_rest_api_integration_backend(
                 template = integration["requestTemplates"][APPLICATION_JSON]
                 account_id, queue = uri.split("/")[-2:]
                 region_name = uri.split(":")[3]
-
-                new_request = "%s&QueueName=%s" % (
-                    aws_stack.render_velocity_template(template, data),
-                    queue,
-                )
+                if "GetQueueUrl" in template or "CreateQueue" in template:
+                    new_request = (
+                        f"{aws_stack.render_velocity_template(template, data)}&QueueName={queue}"
+                    )
+                else:
+                    queue_url = f"{config.get_edge_url()}/{account_id}/{queue}"
+                    new_request = (
+                        f"{aws_stack.render_velocity_template(template, data)}&QueueUrl={queue_url}"
+                    )
                 headers = aws_stack.mock_aws_request_headers(service="sqs", region_name=region_name)
 
-                url = urljoin(config.TEST_SQS_URL, "%s/%s" % (TEST_AWS_ACCOUNT_ID, queue))
+                url = urljoin(config.service_url("sqs"), f"{TEST_AWS_ACCOUNT_ID}/{queue}")
                 result = common.make_http_request(
                     url, method="POST", headers=headers, data=new_request
                 )
@@ -812,7 +883,7 @@ def invoke_rest_api_integration_backend(
 
                 if response_template is None:
                     msg = "Invalid response template defined in integration response."
-                    LOG.info("%s Existing: %s" % (msg, response_templates))
+                    LOG.info("%s Existing: %s", msg, response_templates)
                     return make_error_response(msg, 404)
 
                 response_template = json.loads(response_template)
@@ -852,7 +923,9 @@ def invoke_rest_api_integration_backend(
         data = apply_template(integration, "request", data)
         if isinstance(data, dict):
             data = json.dumps(data)
-        uri = apply_request_parameter(uri, integration=integration, path_params=path_params)
+        uri = apply_request_parameters(
+            uri, integration=integration, path_params=path_params, query_params=query_string_params
+        )
         result = requests.request(method=method, url=uri, data=data, headers=headers)
         # apply custom response template
         result = apply_template(integration, "response", result)
@@ -899,11 +972,15 @@ def get_stage_variables(api_id: str, stage: str) -> Dict[str, str]:
         return {}
     region_name = [name for name, region in apigateway_backends.items() if api_id in region.apis][0]
     api_gateway_client = aws_stack.connect_to_service("apigateway", region_name=region_name)
-    response = api_gateway_client.get_stage(restApiId=api_id, stageName=stage)
-    return response.get("variables")
+    try:
+        response = api_gateway_client.get_stage(restApiId=api_id, stageName=stage)
+        return response.get("variables")
+    except Exception:
+        LOG.info(f"Failed to get stage {stage} for api id {api_id}")
+        return {}
 
 
-def get_lambda_event_request_context(invocation_context: ApiInvocationContext):
+def get_event_request_context(invocation_context: ApiInvocationContext):
     method = invocation_context.method
     path = invocation_context.path
     headers = invocation_context.headers
@@ -938,7 +1015,9 @@ def get_lambda_event_request_context(invocation_context: ApiInvocationContext):
         },
         "httpMethod": method,
         "protocol": "HTTP/1.1",
-        "requestTime": datetime.datetime.utcnow(),
+        "requestTime": pytz.utc.localize(datetime.datetime.utcnow()).strftime(
+            REQUEST_TIME_DATE_FORMAT
+        ),
         "requestTimeEpoch": int(time.time() * 1000),
     }
 

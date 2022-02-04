@@ -3,28 +3,29 @@ import json
 import logging
 import os
 from io import BytesIO
+from typing import Union
 
 import boto3.dynamodb.types
-
-from localstack.utils.common import to_bytes, to_str
 
 TEST_BUCKET_NAME = "test-bucket"
 KINESIS_STREAM_NAME = "test_stream_1"
 MSG_BODY_RAISE_ERROR_FLAG = "raise_error"
 MSG_BODY_MESSAGE_TARGET = "message_target"
+MSG_BODY_DELETE_BATCH = "delete_batch_test"
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.INFO)
 
-# TODO: should be injected by Lambda executor! (Doesn't seem to be the case for default python executor?)
-os.environ["AWS_ACCESS_KEY_ID"] = os.environ.get("AWS_ACCESS_KEY_ID") or "test"
-os.environ["AWS_SECRET_ACCESS_KEY"] = os.environ.get("AWS_SECRET_ACCESS_KEY") or "test"
 
-ENDPOINT_URL = "http://%s:%s" % (
-    os.environ["LOCALSTACK_HOSTNAME"],
-    os.environ.get("EDGE_PORT", 4566),
-)
+# Do not import this function from localstack.utils.common (this is a standalone application / lambda).
+def to_str(obj: Union[str, bytes], encoding: str = "utf-8", errors="strict") -> str:
+    return obj.decode(encoding, errors) if isinstance(obj, bytes) else obj
+
+
+# Do not import this function from localstack.utils.common (this is a standalone application / lambda).
+def to_bytes(obj: Union[str, bytes], encoding: str = "utf-8", errors="strict") -> bytes:
+    return obj.encode(encoding, errors) if isinstance(obj, str) else obj
 
 
 # Subclass of boto's TypeDeserializer for DynamoDB
@@ -62,6 +63,7 @@ def handler(event, context):
         body["httpMethod"] = event.get("httpMethod")
         body["body"] = event.get("body")
         body["headers"] = event.get("headers")
+        body["isBase64Encoded"] = event.get("isBase64Encoded")
         if body["httpMethod"] == "DELETE":
             return {"statusCode": 204}
 
@@ -82,6 +84,16 @@ def handler(event, context):
             "multiValueHeaders": {"set-cookie": ["language=en-US", "theme=blue moon"]},
             **base64_response,
         }
+    if MSG_BODY_DELETE_BATCH in event:
+        sqs_client = create_external_boto_client("sqs")
+        queue_url = event.get(MSG_BODY_DELETE_BATCH)
+        message = sqs_client.receive_message(QueueUrl=queue_url)["Messages"][0]
+        sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=message["ReceiptHandle"])
+        messages = sqs_client.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)[
+            "Messages"
+        ]
+        entries = [message["ReceiptHandle"] for message in messages]
+        sqs_client.delete_message_batch(QueueUrl=queue_url, Entries=entries)
 
     if "Records" not in event:
         result_map = {"event": event, "context": {}}
@@ -118,7 +130,7 @@ def handler(event, context):
                 kinesis_record["Data"] = json.dumps(ddb_new_image["data"])
                 forward_event_to_target_stream(kinesis_record, target_name)
             elif forwarding_target.startswith("s3:"):
-                s3_client = connect_to_service("s3")
+                s3_client = create_external_boto_client("s3")
                 test_data = to_bytes(json.dumps({"test_data": ddb_new_image["data"]["test_data"]}))
                 s3_client.upload_fileobj(BytesIO(test_data), TEST_BUCKET_NAME, target_name)
         else:
@@ -161,16 +173,17 @@ def deserialize_event(event):
 def forward_events(records):
     if not records:
         return
-    kinesis = connect_to_service("kinesis")
+    kinesis = create_external_boto_client("kinesis")
     kinesis.put_records(StreamName=KINESIS_STREAM_NAME, Records=records)
 
 
 def forward_event_to_target_stream(record, stream_name):
-    kinesis = connect_to_service("kinesis")
+    kinesis = create_external_boto_client("kinesis")
     kinesis.put_record(
         StreamName=stream_name, Data=record["Data"], PartitionKey=record["PartitionKey"]
     )
 
 
-def connect_to_service(service):
-    return boto3.client(service, endpoint_url=ENDPOINT_URL)
+def create_external_boto_client(service):
+    endpoint_url = f"http://{os.environ['LOCALSTACK_HOSTNAME']}:{os.environ.get('EDGE_PORT', 4566)}"
+    return boto3.client(service, endpoint_url=endpoint_url)

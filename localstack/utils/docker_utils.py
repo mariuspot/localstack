@@ -1,4 +1,6 @@
+import dataclasses
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +26,7 @@ from docker.utils.socket import STDERR, STDOUT, frames_iter
 from localstack import config
 from localstack.utils.common import (
     TMP_FILES,
+    HashableList,
     rm_rf,
     safe_run,
     save_file,
@@ -83,13 +86,6 @@ class NoSuchNetwork(ContainerException):
 class PortMappings(object):
     """Maps source to target port ranges for Docker port mappings."""
 
-    class HashableList(list):
-        def __hash__(self):
-            result = 0
-            for i in self:
-                result += hash(i)
-            return result
-
     def __init__(self, bind_host=None):
         self.bind_host = bind_host if bind_host else ""
         self.mappings = {}
@@ -140,7 +136,7 @@ class PortMappings(object):
             port_range = [bisected_host_port, port, protocol]
         else:
             port_range = [port, bisected_host_port, protocol]
-        self.mappings[self.HashableList(port_range)] = [mapped, mapped]
+        self.mappings[HashableList(port_range)] = [mapped, mapped]
 
     def to_str(self) -> str:
         bind_address = f"{self.bind_host}:" if self.bind_host else ""
@@ -225,21 +221,140 @@ class PortMappings(object):
         else:
             range[1] = port - 1
 
+    def __repr__(self):
+        return f"<PortMappings: {self.to_dict()}>"
+
+
+SimpleVolumeBind = Tuple[str, str]
+"""Type alias for a simple version of VolumeBind"""
+
+
+@dataclasses.dataclass
+class VolumeBind:
+    """Represents a --volume argument run/create command. When using VolumeBind to bind-mount a file or directory
+    that does not yet exist on the Docker host, -v creates the endpoint for you. It is always created as a directory.
+    """
+
+    host_dir: str
+    container_dir: str
+    options: Optional[List[str]] = None
+
+    def to_str(self) -> str:
+        args = []
+
+        if self.host_dir:
+            args.append(self.host_dir)
+
+        if not self.container_dir:
+            raise ValueError("no container dir specified")
+
+        args.append(self.container_dir)
+
+        if self.options:
+            args.append(self.options)
+
+        return ":".join(args)
+
+
+class VolumeMappings:
+    mappings: List[Union[SimpleVolumeBind, VolumeBind]]
+
+    def __init__(self, mappings: List[Union[SimpleVolumeBind, VolumeBind]] = None):
+        self.mappings = mappings if mappings is not None else []
+
+    def add(self, mapping: Union[SimpleVolumeBind, VolumeBind]):
+        self.append(mapping)
+
+    def append(
+        self,
+        mapping: Union[
+            SimpleVolumeBind,
+            VolumeBind,
+        ],
+    ):
+        self.mappings.append(mapping)
+
+    def __iter__(self):
+        return self.mappings.__iter__()
+
+
+@dataclasses.dataclass
+class ContainerConfiguration:
+    image_name: str
+    name: Optional[str] = None
+    volumes: Optional[VolumeMappings] = None
+    ports: Optional[PortMappings] = None
+    entrypoint: Optional[str] = None
+    additional_flags: Optional[List[str]] = None
+    command: Optional[List[str]] = None
+    env_vars: Dict[str, str] = dataclasses.field(default_factory=dict)
+
+    privileged: Optional[bool] = None
+    remove: Optional[bool] = None
+    interactive: Optional[bool] = None
+    tty: Optional[bool] = None
+    detach: Optional[bool] = None
+
+    stdin: Optional[str] = None
+    user: Optional[str] = None
+    cap_add: Optional[str] = None
+    network: Optional[str] = None
+    dns: Optional[str] = None
+    workdir: Optional[str] = None
+
 
 class ContainerClient(metaclass=ABCMeta):
+    STOP_TIMEOUT = 0
+
     @abstractmethod
     def get_container_status(self, container_name: str) -> DockerContainerStatus:
         """Returns the status of the container with the given name"""
         pass
 
-    @abstractmethod
-    def get_network(self, container_name: str) -> str:
-        """Returns the network mode of the container with the given name"""
-        pass
+    def get_networks(self, container_name: str) -> List[str]:
+        LOG.debug("Getting networks for container: %s", container_name)
+        container_attrs = self.inspect_container(container_name_or_id=container_name)
+        return list(container_attrs["NetworkSettings"]["Networks"].keys())
+
+    def get_container_ipv4_for_network(
+        self, container_name_or_id: str, container_network: str
+    ) -> str:
+        """
+        Returns the IPv4 address for the container on the interface connected to the given network
+        :param container_name_or_id: Container to inspect
+        :param container_network: Network the IP address will belong to
+        :return: IP address of the given container on the interface connected to the given network
+        """
+        LOG.debug(
+            "Getting ipv4 address for container %s in network %s.",
+            container_name_or_id,
+            container_network,
+        )
+        # we always need the ID for this
+        container_id = self.get_container_id(container_name=container_name_or_id)
+        network_attrs = self.inspect_network(container_network)
+        containers = network_attrs["Containers"]
+        if container_id not in containers:
+            raise ContainerException(
+                "Container %s is not connected to target network %s",
+                container_name_or_id,
+                container_network,
+            )
+        try:
+            ip = str(ipaddress.IPv4Interface(containers[container_id]["IPv4Address"]).ip)
+        except Exception as e:
+            raise ContainerException(
+                f"Unable to detect IP address for container {container_name_or_id} in network {container_network}: {e}"
+            )
+        return ip
 
     @abstractmethod
-    def stop_container(self, container_name: str):
-        """Stops container with given name"""
+    def stop_container(self, container_name: str, timeout: int = None):
+        """Stops container with given name
+        :param container_name: Container identifier (name or id) of the container to be stopped
+        :param timeout: Timeout after which SIGKILL is sent to the container.
+                        If not specified, defaults to `STOP_TIMEOUT`
+        """
         pass
 
     @abstractmethod
@@ -308,9 +423,11 @@ class ContainerClient(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def inspect_image(self, image_name: str) -> Dict[str, Union[Dict, str]]:
+    def inspect_image(self, image_name: str, pull: bool = True) -> Dict[str, Union[Dict, str]]:
         """Get detailed attributes of an image.
 
+        :param image_name: Image name to inspect
+        :param pull: Whether to pull image if not existent
         :return: Dict containing docker attributes as returned by the daemon
         """
         pass
@@ -320,6 +437,29 @@ class ContainerClient(metaclass=ABCMeta):
         """Get detailed attributes of an network.
 
         :return: Dict containing docker attributes as returned by the daemon
+        """
+        pass
+
+    @abstractmethod
+    def connect_container_to_network(
+        self, network_name: str, container_name_or_id: str, aliases: Optional[List] = None
+    ) -> None:
+        """
+        Connects a container to a given network
+        :param network_name: Network to connect the container to
+        :param container_name_or_id: Container to connect to the network
+        :param aliases: List of dns names the container should be available under in the network
+        """
+        pass
+
+    @abstractmethod
+    def disconnect_container_from_network(
+        self, network_name: str, container_name_or_id: str
+    ) -> None:
+        """
+        Disconnects a container from a given network
+        :param network_name: Network to disconnect the container from
+        :param container_name_or_id: Container to disconnect from the network
         """
         pass
 
@@ -339,16 +479,24 @@ class ContainerClient(metaclass=ABCMeta):
         """
         pass
 
-    def get_image_cmd(self, docker_image: str) -> str:
-        """Get the command for the given image"""
-        cmd_list = self.inspect_image(docker_image)["Config"]["Cmd"] or []
-        return " ".join(cmd_list)
+    def get_image_cmd(self, docker_image: str, pull: bool = True) -> List[str]:
+        """Get the command for the given image
+        :param docker_image: Docker image to inspect
+        :param pull: Whether to pull if image is not present
+        :return: Image command in its array form
+        """
+        cmd_list = self.inspect_image(docker_image, pull)["Config"]["Cmd"] or []
+        return cmd_list
 
-    def get_image_entrypoint(self, docker_image: str) -> str:
-        """Get the entry point for the given image"""
+    def get_image_entrypoint(self, docker_image: str, pull: bool = True) -> str:
+        """Get the entry point for the given image
+        :param docker_image: Docker image to inspect
+        :param pull: Whether to pull if image is not present
+        :return: Image entrypoint
+        """
         LOG.debug("Getting the entrypoint for image: %s", docker_image)
-        entrypoint_list = self.inspect_image(docker_image)["Config"]["Entrypoint"] or []
-        return " ".join(entrypoint_list)
+        entrypoint_list = self.inspect_image(docker_image, pull)["Config"]["Entrypoint"] or []
+        return shlex.join(entrypoint_list)
 
     @abstractmethod
     def has_docker(self) -> bool:
@@ -367,7 +515,7 @@ class ContainerClient(metaclass=ABCMeta):
         tty: bool = False,
         detach: bool = False,
         command: Optional[Union[List[str], str]] = None,
-        mount_volumes: Optional[List[Tuple[str, str]]] = None,
+        mount_volumes: Optional[List[SimpleVolumeBind]] = None,
         ports: Optional[PortMappings] = None,
         env_vars: Optional[Dict[str, str]] = None,
         user: Optional[str] = None,
@@ -396,7 +544,7 @@ class ContainerClient(metaclass=ABCMeta):
         tty: bool = False,
         detach: bool = False,
         command: Optional[Union[List[str], str]] = None,
-        mount_volumes: Optional[List[Tuple[str, str]]] = None,
+        mount_volumes: Optional[List[SimpleVolumeBind]] = None,
         ports: Optional[PortMappings] = None,
         env_vars: Optional[Dict[str, str]] = None,
         user: Optional[str] = None,
@@ -419,7 +567,7 @@ class ContainerClient(metaclass=ABCMeta):
         command: Union[List[str], str],
         interactive: bool = False,
         detach: bool = False,
-        env_vars: Optional[Dict[str, str]] = None,
+        env_vars: Optional[Dict[str, Optional[str]]] = None,
         stdin: Optional[bytes] = None,
         user: Optional[str] = None,
     ) -> Tuple[bytes, bytes]:
@@ -448,6 +596,8 @@ class ContainerClient(metaclass=ABCMeta):
 class CmdDockerClient(ContainerClient):
     """Class for managing docker containers using the command line executable"""
 
+    default_run_outfile: Optional[str] = None
+
     def _docker_cmd(self) -> List[str]:
         """Return the string to be used for running Docker commands."""
         return config.DOCKER_CMD.split()
@@ -474,32 +624,11 @@ class CmdDockerClient(ContainerClient):
         else:
             return DockerContainerStatus.DOWN
 
-    def get_network(self, container_name: str) -> str:
-        LOG.debug("Getting container network: %s", container_name)
+    def stop_container(self, container_name: str, timeout: int = None) -> None:
+        if timeout is None:
+            timeout = self.STOP_TIMEOUT
         cmd = self._docker_cmd()
-        cmd += [
-            "inspect",
-            container_name,
-            "--format",
-            "{{ .HostConfig.NetworkMode }}",
-        ]
-
-        try:
-            cmd_result = safe_run(cmd)
-        except subprocess.CalledProcessError as e:
-            if "No such container" in to_str(e.stdout):
-                raise NoSuchContainer(container_name, stdout=e.stdout, stderr=e.stderr)
-            else:
-                raise ContainerException(
-                    "Docker process returned with errorcode %s" % e.returncode, e.stdout, e.stderr
-                )
-
-        container_network = cmd_result.strip()
-        return container_network
-
-    def stop_container(self, container_name: str) -> None:
-        cmd = self._docker_cmd()
-        cmd += ["stop", "-t0", container_name]
+        cmd += ["stop", "--time", str(timeout), container_name]
         LOG.debug("Stopping container with cmd %s", cmd)
         try:
             safe_run(cmd)
@@ -540,10 +669,7 @@ class CmdDockerClient(ContainerClient):
             options += [y for filter_item in filter for y in ["--filter", filter_item]]
         cmd += options
         cmd.append("--format")
-        cmd.append(
-            '{"id":"{{ .ID }}","image":"{{ .Image }}","name":"{{ .Names }}",'
-            '"labels":"{{ .Labels }}","status":"{{ .State }}"}'
-        )
+        cmd.append("{{json . }}")
         try:
             cmd_result = safe_run(cmd).strip()
         except subprocess.CalledProcessError as e:
@@ -553,7 +679,18 @@ class CmdDockerClient(ContainerClient):
         container_list = []
         if cmd_result:
             container_list = [json.loads(line) for line in cmd_result.splitlines()]
-        return container_list
+        result = []
+        for container in container_list:
+            result.append(
+                {
+                    "id": container["ID"],
+                    "image": container["Image"],
+                    "name": container["Names"],
+                    "status": container["State"],
+                    "labels": container["Labels"],
+                }
+            )
+        return result
 
     def copy_into_container(
         self, container_name: str, local_path: str, container_path: str
@@ -610,7 +747,7 @@ class CmdDockerClient(ContainerClient):
                 Util.append_without_latest(image_names)
             return image_names
         except Exception as e:
-            LOG.info('Unable to list Docker images via "%s": %s' % (cmd, e))
+            LOG.info('Unable to list Docker images via "%s": %s', cmd, e)
             return []
 
     def get_container_logs(self, container_name_or_id: str, safe=False) -> str:
@@ -649,10 +786,13 @@ class CmdDockerClient(ContainerClient):
         except NoSuchObject as e:
             raise NoSuchContainer(container_name_or_id=e.object_id)
 
-    def inspect_image(self, image_name: str) -> Dict[str, Union[Dict, str]]:
+    def inspect_image(self, image_name: str, pull: bool = True) -> Dict[str, Union[Dict, str]]:
         try:
             return self._inspect_object(image_name)
         except NoSuchObject as e:
+            if pull:
+                self.pull_image(image_name)
+                return self.inspect_image(image_name, pull=False)
             raise NoSuchImage(image_name=e.object_id)
 
     def inspect_network(self, network_name: str) -> Dict[str, Union[Dict, str]]:
@@ -661,16 +801,64 @@ class CmdDockerClient(ContainerClient):
         except NoSuchObject as e:
             raise NoSuchNetwork(network_name=e.object_id)
 
+    def connect_container_to_network(
+        self, network_name: str, container_name_or_id: str, aliases: Optional[List] = None
+    ) -> None:
+        LOG.debug(
+            "Connecting container '%s' to network '%s' with aliases '%s'",
+            container_name_or_id,
+            network_name,
+            aliases,
+        )
+        cmd = self._docker_cmd()
+        cmd += ["network", "connect"]
+        if aliases:
+            cmd += ["--alias", ",".join(aliases)]
+        cmd += [network_name, container_name_or_id]
+        try:
+            safe_run(cmd)
+        except subprocess.CalledProcessError as e:
+            stdout_str = to_str(e.stdout)
+            if re.match(r".*network (.*) not found.*", stdout_str):
+                raise NoSuchNetwork(network_name=network_name)
+            elif "No such container" in stdout_str:
+                raise NoSuchContainer(container_name_or_id, stdout=e.stdout, stderr=e.stderr)
+            else:
+                raise ContainerException(
+                    "Docker process returned with errorcode %s" % e.returncode, e.stdout, e.stderr
+                )
+
+    def disconnect_container_from_network(
+        self, network_name: str, container_name_or_id: str
+    ) -> None:
+        LOG.debug(
+            "Disconnecting container '%s' from network '%s'", container_name_or_id, network_name
+        )
+        cmd = self._docker_cmd() + ["network", "disconnect", network_name, container_name_or_id]
+        try:
+            safe_run(cmd)
+        except subprocess.CalledProcessError as e:
+            stdout_str = to_str(e.stdout)
+            if re.match(r".*network (.*) not found.*", stdout_str):
+                raise NoSuchNetwork(network_name=network_name)
+            elif "No such container" in stdout_str:
+                raise NoSuchContainer(container_name_or_id, stdout=e.stdout, stderr=e.stderr)
+            else:
+                raise ContainerException(
+                    "Docker process returned with errorcode %s" % e.returncode, e.stdout, e.stderr
+                )
+
     def get_container_ip(self, container_name_or_id: str) -> str:
         cmd = self._docker_cmd()
         cmd += [
             "inspect",
             "--format",
-            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
             container_name_or_id,
         ]
         try:
-            return safe_run(cmd).strip()
+            result = safe_run(cmd).strip()
+            return result.split(" ")[0] if result else ""
         except subprocess.CalledProcessError as e:
             if "No such object" in to_str(e.stdout):
                 raise NoSuchContainer(container_name_or_id, stdout=e.stdout, stderr=e.stderr)
@@ -716,7 +904,7 @@ class CmdDockerClient(ContainerClient):
         command: Union[List[str], str],
         interactive=False,
         detach=False,
-        env_vars: Optional[Dict[str, str]] = None,
+        env_vars: Optional[Dict[str, Optional[str]]] = None,
         stdin: Optional[bytes] = None,
         user: Optional[str] = None,
     ) -> Tuple[bytes, bytes]:
@@ -765,7 +953,7 @@ class CmdDockerClient(ContainerClient):
             "inherit_env": True,
             "asynchronous": True,
             "stderr": subprocess.PIPE,
-            "outfile": subprocess.PIPE,
+            "outfile": self.default_run_outfile or subprocess.PIPE,
         }
         if stdin:
             kwargs["stdin"] = True
@@ -803,7 +991,7 @@ class CmdDockerClient(ContainerClient):
         tty: bool = False,
         detach: bool = False,
         command: Optional[Union[List[str], str]] = None,
-        mount_volumes: Optional[List[Tuple[str, str]]] = None,
+        mount_volumes: Optional[List[SimpleVolumeBind]] = None,
         ports: Optional[PortMappings] = None,
         env_vars: Optional[Dict[str, str]] = None,
         user: Optional[str] = None,
@@ -824,7 +1012,7 @@ class CmdDockerClient(ContainerClient):
         if mount_volumes:
             cmd += [
                 volume
-                for host_path, docker_path in mount_volumes
+                for host_path, docker_path in dict(mount_volumes).items()
                 for volume in ["-v", f"{host_path}:{docker_path}"]
             ]
         if interactive:
@@ -859,6 +1047,12 @@ class CmdDockerClient(ContainerClient):
 class Util:
     MAX_ENV_ARGS_LENGTH = 20000
 
+    @staticmethod
+    def format_env_vars(key: str, value: Optional[str]):
+        if value is None:
+            return key
+        return f"{key}={value}"
+
     @classmethod
     def create_env_vars_file_flag(cls, env_vars: Dict) -> Tuple[List[str], Optional[str]]:
         if not env_vars:
@@ -876,11 +1070,13 @@ class Util:
                     continue
                 env_vars.pop(name)
                 value = value.replace("\n", "\\")
-                env_content += "%s=%s\n" % (name, value)
+                env_content += f"{cls.format_env_vars(name, value)}\n"
             save_file(env_file, env_content)
             result += ["--env-file", env_file]
 
-        env_vars_res = [item for k, v in env_vars.items() for item in ["-e", "{}={}".format(k, v)]]
+        env_vars_res = [
+            item for k, v in env_vars.items() for item in ["-e", cls.format_env_vars(k, v)]
+        ]
         result += env_vars_res
         return result, env_file
 
@@ -891,7 +1087,7 @@ class Util:
 
     @staticmethod
     def mountable_tmp_file():
-        f = os.path.join(config.TMP_FOLDER, short_uid())
+        f = os.path.join(config.dirs.tmp, short_uid())
         TMP_FILES.append(f)
         return f
 
@@ -936,10 +1132,14 @@ class Util:
         additional_flags: str,
         env_vars: Dict[str, str] = None,
         ports: PortMappings = None,
-        mounts: List[Tuple[str, str]] = None,
+        mounts: List[SimpleVolumeBind] = None,
         network: Optional[str] = None,
     ) -> Tuple[
-        Dict[str, str], PortMappings, List[Tuple[str, str]], Optional[Dict[str, str]], Optional[str]
+        Dict[str, str],
+        PortMappings,
+        List[SimpleVolumeBind],
+        Optional[Dict[str, str]],
+        Optional[str],
     ]:
         """Parses environment, volume and port flags passed as string
         :param additional_flags: String which contains the flag definitions
@@ -1031,7 +1231,7 @@ class Util:
 
     @staticmethod
     def convert_mount_list_to_dict(
-        mount_volumes: List[Tuple[str, str]]
+        mount_volumes: List[SimpleVolumeBind],
     ) -> Dict[str, Dict[str, str]]:
         """Converts a List of (host_path, container_path) tuples to a Dict suitable as volume argument for docker sdk"""
         return dict(
@@ -1109,21 +1309,13 @@ class SdkDockerClient(ContainerClient):
         except APIError:
             raise ContainerException()
 
-    def get_network(self, container_name: str) -> str:
-        LOG.debug("Getting network type for container: %s", container_name)
-        try:
-            container = self.client().containers.get(container_name)
-            return container.attrs["HostConfig"]["NetworkMode"]
-        except NotFound:
-            raise NoSuchContainer(container_name)
-        except APIError:
-            raise ContainerException()
-
-    def stop_container(self, container_name: str) -> None:
+    def stop_container(self, container_name: str, timeout: int = None) -> None:
+        if timeout is None:
+            timeout = self.STOP_TIMEOUT
         LOG.debug("Stopping container: %s", container_name)
         try:
             container = self.client().containers.get(container_name)
-            container.stop(timeout=0)
+            container.stop(timeout=timeout)
         except NotFound:
             raise NoSuchContainer(container_name)
         except APIError:
@@ -1150,18 +1342,21 @@ class SdkDockerClient(ContainerClient):
         LOG.debug("Listing containers with filters: %s", filter)
         try:
             container_list = self.client().containers.list(filters=filter, all=all)
-            return list(
-                map(
-                    lambda container: {
-                        "id": container.id,
-                        "image": container.image,
-                        "name": container.name,
-                        "status": container.status,
-                        "labels": container.labels,
-                    },
-                    container_list,
-                )
-            )
+            result = []
+            for container in container_list:
+                try:
+                    result.append(
+                        {
+                            "id": container.id,
+                            "image": container.image,
+                            "name": container.name,
+                            "status": container.status,
+                            "labels": container.labels,
+                        }
+                    )
+                except Exception as e:
+                    LOG.error(f"Error checking container {container}: {e}")
+            return result
         except APIError:
             raise ContainerException()
 
@@ -1240,10 +1435,13 @@ class SdkDockerClient(ContainerClient):
         except APIError:
             raise ContainerException()
 
-    def inspect_image(self, image_name: str) -> Dict[str, Union[Dict, str]]:
+    def inspect_image(self, image_name: str, pull: bool = True) -> Dict[str, Union[Dict, str]]:
         try:
             return self.client().images.get(image_name).attrs
         except NotFound:
+            if pull:
+                self.pull_image(image_name)
+                return self.inspect_image(image_name, pull=False)
             raise NoSuchImage(image_name)
         except APIError:
             raise ContainerException()
@@ -1253,6 +1451,44 @@ class SdkDockerClient(ContainerClient):
             return self.client().networks.get(network_name).attrs
         except NotFound:
             raise NoSuchNetwork(network_name)
+        except APIError:
+            raise ContainerException()
+
+    def connect_container_to_network(
+        self, network_name: str, container_name_or_id: str, aliases: Optional[List] = None
+    ) -> None:
+        LOG.debug(
+            "Connecting container '%s' to network '%s' with aliases '%s'",
+            container_name_or_id,
+            network_name,
+            aliases,
+        )
+        try:
+            network = self.client().networks.get(network_name)
+        except NotFound:
+            raise NoSuchNetwork(network_name)
+        try:
+            network.connect(container=container_name_or_id, aliases=aliases)
+        except NotFound:
+            raise NoSuchContainer(container_name_or_id)
+        except APIError:
+            raise ContainerException()
+
+    def disconnect_container_from_network(
+        self, network_name: str, container_name_or_id: str
+    ) -> None:
+        LOG.debug(
+            "Disconnecting container '%s' from network '%s'", container_name_or_id, network_name
+        )
+        try:
+            try:
+                network = self.client().networks.get(network_name)
+            except NotFound:
+                raise NoSuchNetwork(network_name)
+            try:
+                network.disconnect(container_name_or_id)
+            except NotFound:
+                raise NoSuchContainer(container_name_or_id)
         except APIError:
             raise ContainerException()
 
@@ -1318,16 +1554,19 @@ class SdkDockerClient(ContainerClient):
                 start_waiting.set()
 
                 # handle container input/output
-                with sock:
-                    try:
-                        if stdin:
-                            sock.sendall(to_bytes(stdin))
-                            sock.shutdown(socket.SHUT_WR)
-                        stdout, stderr = self._read_from_sock(sock, False)
-                    except socket.timeout:
-                        LOG.debug(
-                            f"Socket timeout when talking to the I/O streams of Docker container '{container_name_or_id}'"
-                        )
+                # under windows, the socket has no __enter__ / cannot be used as context manager
+                # therefore try/finally instead of with here
+                try:
+                    if stdin:
+                        sock.sendall(to_bytes(stdin))
+                        sock.shutdown(socket.SHUT_WR)
+                    stdout, stderr = self._read_from_sock(sock, False)
+                except socket.timeout:
+                    LOG.debug(
+                        f"Socket timeout when talking to the I/O streams of Docker container '{container_name_or_id}'"
+                    )
+                finally:
+                    sock.close()
 
                 # get container exit code
                 exit_code = result_queue.get()
@@ -1356,7 +1595,7 @@ class SdkDockerClient(ContainerClient):
         tty: bool = False,
         detach: bool = False,
         command: Optional[Union[List[str], str]] = None,
-        mount_volumes: Optional[List[Tuple[str, str]]] = None,
+        mount_volumes: Optional[List[SimpleVolumeBind]] = None,
         ports: Optional[PortMappings] = None,
         env_vars: Optional[Dict[str, str]] = None,
         user: Optional[str] = None,
@@ -1366,13 +1605,7 @@ class SdkDockerClient(ContainerClient):
         additional_flags: Optional[str] = None,
         workdir: Optional[str] = None,
     ) -> str:
-        LOG.debug(
-            "Creating container with image %s, command '%s', volumes %s, env vars %s",
-            image_name,
-            command,
-            mount_volumes,
-            env_vars,
-        )
+        LOG.debug("Creating container with attributes: %s", locals())
         extra_hosts = None
         if additional_flags:
             env_vars, ports, mount_volumes, extra_hosts, network = Util.parse_additional_flags(
@@ -1433,7 +1666,7 @@ class SdkDockerClient(ContainerClient):
         tty: bool = False,
         detach: bool = False,
         command: Optional[Union[List[str], str]] = None,
-        mount_volumes: Optional[List[Tuple[str, str]]] = None,
+        mount_volumes: Optional[List[SimpleVolumeBind]] = None,
         ports: Optional[PortMappings] = None,
         env_vars: Optional[Dict[str, str]] = None,
         user: Optional[str] = None,
@@ -1482,7 +1715,7 @@ class SdkDockerClient(ContainerClient):
         command: Union[List[str], str],
         interactive=False,
         detach=False,
-        env_vars: Optional[Dict[str, str]] = None,
+        env_vars: Optional[Dict[str, Optional[str]]] = None,
         stdin: Optional[bytes] = None,
         user: Optional[str] = None,
     ) -> Tuple[bytes, bytes]:

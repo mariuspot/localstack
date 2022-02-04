@@ -11,9 +11,11 @@ import zipfile
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import boto3
 import requests
 from six import iteritems
 
+from localstack import config
 from localstack.constants import (
     ENV_INTERNAL_TEST_RUN,
     LAMBDA_TEST_ROLE,
@@ -33,7 +35,7 @@ from localstack.utils.common import (
     chmod_r,
     ensure_list,
     get_free_tcp_port,
-    is_alpine,
+    is_debian,
     is_empty_dir,
     is_port_open,
     load_file,
@@ -60,14 +62,14 @@ def is_local_test_mode():
 
 
 def copy_dir(source, target):
-    if is_alpine():
+    if is_debian():
         # Using the native command can be an order of magnitude faster on Travis-CI
         return run("cp -r %s %s" % (source, target))
     shutil.copytree(source, target)
 
 
 def rm_dir(dir):
-    if is_alpine():
+    if is_debian():
         # Using the native command can be an order of magnitude faster on Travis-CI
         return run("rm -r %s" % dir)
     shutil.rmtree(dir)
@@ -76,12 +78,14 @@ def rm_dir(dir):
 def create_lambda_archive(
     script: str,
     get_content: bool = False,
-    libs: List[str] = [],
+    libs: List[str] = None,
     runtime: str = None,
     file_name: str = None,
     exclude_func: Callable[[str], bool] = None,
 ):
     """Utility method to create a Lambda function archive"""
+    if libs is None:
+        libs = []
     runtime = runtime or LAMBDA_DEFAULT_RUNTIME
 
     with tempfile.TemporaryDirectory(prefix=ARCHIVE_DIR_PREFIX) as tmp_dir:
@@ -185,7 +189,7 @@ def create_zip_file(file_path, zip_file=None, get_content=False, content_root=No
         return full_zip_file
 
     # create zip file
-    if is_alpine():
+    if is_debian():
         # todo: extend CLI with the new parameters
         create_zip_file_cli(source_path=file_path, base_dir=base_dir, zip_file=full_zip_file)
     else:
@@ -213,18 +217,25 @@ def create_lambda_function(
     handler=None,
     starting_position=None,
     runtime=None,
-    envvars={},
-    tags={},
-    libs=[],
+    envvars=None,
+    tags=None,
+    libs=None,
     delete=False,
     layers=None,
+    client=None,
     **kwargs,
 ):
     """Utility method to create a new function via the Lambda API"""
+    if envvars is None:
+        envvars = {}
+    if tags is None:
+        tags = {}
+    if libs is None:
+        libs = []
 
     starting_position = starting_position or LAMBDA_DEFAULT_STARTING_POSITION
     runtime = runtime or LAMBDA_DEFAULT_RUNTIME
-    client = aws_stack.connect_to_service("lambda")
+    client = client or aws_stack.connect_to_service("lambda")
 
     # load zip file content if handler_file is specified
     if not zip_file and handler_file:
@@ -295,12 +306,14 @@ def connect_api_gateway_to_http_with_lambda_proxy(
     gateway_name,
     target_uri,
     stage_name=None,
-    methods=[],
+    methods=None,
     path=None,
     auth_type=None,
     auth_creator_func=None,
     http_method=None,
 ):
+    if methods is None:
+        methods = []
     if not methods:
         methods = ["GET", "POST", "DELETE"]
     if not path:
@@ -332,13 +345,15 @@ def create_lambda_api_gateway_integration(
     gateway_name,
     func_name,
     handler_file,
-    methods=[],
+    methods=None,
     path=None,
     runtime=None,
     stage_name=None,
     auth_type=None,
     auth_creator_func=None,
 ):
+    if methods is None:
+        methods = []
     path = path or "/test"
     auth_type = auth_type or "REQUEST"
     stage_name = stage_name or "test"
@@ -444,7 +459,7 @@ def list_all_s3_objects():
 
 def delete_all_s3_objects(buckets):
     s3_client = aws_stack.connect_to_service("s3")
-    buckets = buckets if isinstance(buckets, list) else [buckets]
+    buckets = ensure_list(buckets)
     for bucket in buckets:
         keys = all_s3_object_keys(bucket)
         deletes = [{"Key": key} for key in keys]
@@ -464,14 +479,14 @@ def download_s3_object(s3, bucket, path):
         return result
 
 
-def all_s3_object_keys(bucket):
+def all_s3_object_keys(bucket: str) -> List[str]:
     s3_client = aws_stack.connect_to_resource("s3")
     bucket = s3_client.Bucket(bucket) if isinstance(bucket, str) else bucket
-    keys = [key for key in bucket.objects.all()]
+    keys = [key.key for key in bucket.objects.all()]
     return keys
 
 
-def map_all_s3_objects(to_json=True, buckets=None):
+def map_all_s3_objects(to_json: bool = True, buckets: List[str] = None) -> Dict[str, Any]:
     s3_client = aws_stack.connect_to_resource("s3")
     result = {}
     buckets = ensure_list(buckets)
@@ -529,7 +544,7 @@ def send_dynamodb_request(path, action, request_body):
         "x-amz-target": "DynamoDB_20120810.{}".format(action),
         "Authorization": aws_stack.mock_aws_request_headers("dynamodb")["Authorization"],
     }
-    url = "{}/{}".format(os.getenv("TEST_DYNAMODB_URL"), path)
+    url = f"{config.service_url('dynamodb')}/{path}"
     return requests.put(url, data=request_body, headers=headers, verify=False)
 
 
@@ -576,19 +591,22 @@ def check_expected_lambda_log_events_length(expected_length, function_name, rege
     return events
 
 
+def list_all_log_events(log_group_name: str) -> List[Dict]:
+    logs = aws_stack.connect_to_service("logs")
+    return list_all_resources(
+        lambda kwargs: logs.filter_log_events(logGroupName=log_group_name, **kwargs),
+        last_token_attr_name="nextToken",
+        list_attr_name="events",
+    )
+
+
 def get_lambda_log_events(
     function_name, delay_time=DEFAULT_GET_LOG_EVENTS_DELAY, regex_filter: Optional[str] = None
 ):
-    def get_log_events(function_name, delay_time):
-        time.sleep(delay_time)
-
-        logs = aws_stack.connect_to_service("logs")
-        log_group_name = get_lambda_log_group_name(function_name)
-        return list_all_resources(
-            lambda kwargs: logs.filter_log_events(logGroupName=log_group_name, **kwargs),
-            last_token_attr_name="nextToken",
-            list_attr_name="events",
-        )
+    def get_log_events(func_name, delay):
+        time.sleep(delay)
+        log_group_name = get_lambda_log_group_name(func_name)
+        return list_all_log_events(log_group_name)
 
     try:
         events = get_log_events(function_name, delay_time)
@@ -605,6 +623,9 @@ def get_lambda_log_events(
             or "START" in raw_message
             or "END" in raw_message
             or "REPORT" in raw_message
+            # necessary until tail is updated in docker images. See this PR:
+            # http://git.savannah.gnu.org/gitweb/?p=coreutils.git;a=commitdiff;h=v8.24-111-g1118f32
+            or "tail: unrecognized file system type" in raw_message
             or regex_filter
             and not re.search(regex_filter, raw_message)
         ):
@@ -727,3 +748,12 @@ def list_all_resources(
         collected_items += result.get(list_attr_name, [])
 
     return collected_items
+
+
+def response_arn_matches_partition(client, response_arn: str) -> bool:
+    parsed_arn = aws_stack.parse_arn(response_arn)
+    return (
+        client.meta.partition
+        == boto3.session.Session().get_partition_for_region(parsed_arn["region"])
+        and client.meta.partition == parsed_arn["partition"]
+    )

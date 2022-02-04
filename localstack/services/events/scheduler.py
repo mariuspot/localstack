@@ -21,7 +21,7 @@ class Job(object):
             if self.should_run_now() and self.is_enabled:
                 self.do_run()
         except Exception as e:
-            LOG.debug("Unable to run scheduled function %s: %s" % (self.job_func, e))
+            LOG.debug("Unable to run scheduled function %s: %s", self.job_func, e)
 
     def should_run_now(self):
         schedule = CronTab(self.schedule)
@@ -37,6 +37,7 @@ class JobScheduler(object):
     _instance = None
 
     def __init__(self):
+        # TODO: introduce RLock for mutating jobs list
         self.jobs = []
         self.thread = None
 

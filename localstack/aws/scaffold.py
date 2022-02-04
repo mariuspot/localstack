@@ -134,13 +134,13 @@ class ShapeNode:
     def _print_as_typed_dict(self, output, doc=True, quote_types=False):
         name = self.shape.name
         q = '"' if quote_types else ""
-        output.write('%s = TypedDict("%s", total=False, fields={\n' % (name, name))
+        output.write('%s = TypedDict("%s", {\n' % (name, name))
         for k, v in self.shape.members.items():
             if k in self.shape.required_members:
                 output.write(f'    "{k}": {q}{v.name}{q},\n')
             else:
                 output.write(f'    "{k}": Optional[{q}{v.name}{q}],\n')
-        output.write("})")
+        output.write("}, total=False)")
 
     def print_shape_doc(self, output, shape):
         html = shape.documentation
@@ -187,7 +187,7 @@ class ShapeNode:
         elif shape.type_name == "blob":
             output.write(f"{shape.name} = bytes")  # FIXME check what type blob really is
         elif shape.type_name == "timestamp":
-            output.write(f"{shape.name} = str")
+            output.write(f"{shape.name} = datetime")
         else:
             output.write(f"# unknown shape type for {shape.name}: {shape.type_name}")
         # TODO: BoxedInteger?
@@ -214,6 +214,7 @@ class ShapeNode:
 def generate_service_types(output, service: ServiceModel, doc=True):
     output.write("import sys\n")
     output.write("from typing import Dict, List, Optional\n")
+    output.write("from datetime import datetime\n")
     output.write("if sys.version_info >= (3, 8):\n")
     output.write("    from typing import TypedDict\n")
     output.write("else:\n")
@@ -225,7 +226,7 @@ def generate_service_types(output, service: ServiceModel, doc=True):
     output.write("\n")
 
     # ==================================== print type declarations
-    nodes: Dict[str, ShapeNode] = dict()
+    nodes: Dict[str, ShapeNode] = {}
 
     for shape_name in service.shape_names:
         shape = service.shape_for(shape_name)

@@ -1,16 +1,26 @@
+import logging
+
 from localstack import config
+from localstack.runtime import hooks
 
-# Note: make sure not to add any additional imports at the global scope here!
+LOG = logging.getLogger(__name__)
 
 
-def register_localstack_plugins():
-
-    docker_flags = []
-
-    # add Docker flags for edge ports
-    for port in [config.EDGE_PORT, config.EDGE_PORT_HTTP]:
+@hooks.configure_localstack_container()
+def configure_edge_port(container):
+    ports = [config.EDGE_PORT, config.EDGE_PORT_HTTP]
+    LOG.debug("configuring container with edge ports: %s", ports)
+    for port in ports:
         if port:
-            docker_flags += ["-p {p}:{p}".format(p=port)]
+            container.ports.add(port)
 
-    result = {"docker": {"run_flags": " ".join(docker_flags)}}
-    return result
+
+# Register the ArnPartitionRewriteListener only if the feature flag is enabled
+@hooks.on_infra_start(should_load=lambda: config.ARN_PARTITION_REWRITING)
+def register_partition_adjusting_proxy_listener():
+    LOG.info(
+        "Registering ArnPartitionRewriteListener to dynamically replace partitions in requests and responses."
+    )
+    from localstack.services.generic_proxy import ArnPartitionRewriteListener, ProxyListener
+
+    ProxyListener.DEFAULT_LISTENERS.append(ArnPartitionRewriteListener())

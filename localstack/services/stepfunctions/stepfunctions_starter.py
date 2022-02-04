@@ -17,22 +17,25 @@ MAX_HEAP_SIZE = "256m"
 PROCESS_THREAD = None
 
 
+# TODO: pass env more explicitly
 def get_command(backend_port):
     cmd = (
-        "cd %s; PORT=%s java -Dcom.amazonaws.sdk.disableCertChecking -Xmx%s -jar StepFunctionsLocal.jar "
-        "--aws-region %s --aws-account %s"
+        "cd %s; PORT=%s java "
+        "-javaagent:aspectjweaver-1.9.7.jar "
+        "-Dorg.aspectj.weaver.loadtime.configuration=META-INF/aop.xml "
+        "-Dcom.amazonaws.sdk.disableCertChecking -Xmx%s "
+        "-jar StepFunctionsLocal.jar --aws-account %s"
     ) % (
         install.INSTALL_DIR_STEPFUNCTIONS,
         backend_port,
         MAX_HEAP_SIZE,
-        aws_stack.get_region(),
         TEST_AWS_ACCOUNT_ID,
     )
     if config.STEPFUNCTIONS_LAMBDA_ENDPOINT.lower() != "default":
         lambda_endpoint = config.STEPFUNCTIONS_LAMBDA_ENDPOINT or aws_stack.get_local_service_url(
             "lambda"
         )
-        cmd += (" --lambda-endpoint %s") % (lambda_endpoint)
+        cmd += f" --lambda-endpoint {lambda_endpoint}"
     # add service endpoint flags
     services = [
         "athena",
@@ -48,35 +51,45 @@ def get_command(backend_port):
         "stepfunctions",
     ]
     for service in services:
-        flag = "--%s-endpoint" % service
+        flag = f"--{service}-endpoint"
         if service == "stepfunctions":
             flag = "--step-functions-endpoint"
         elif service == "events":
             flag = "--eventbridge-endpoint"
         elif service in ["athena", "eks"]:
-            flag = "--step-functions-%s" % service
+            flag = f"--step-functions-{service}"
         endpoint = aws_stack.get_local_service_url(service)
-        cmd += " %s %s" % (flag, endpoint)
+        cmd += f" {flag} {endpoint}"
+
     return cmd
 
 
 def start_stepfunctions(port=None, asynchronous=False, update_listener=None):
-    port = port or config.PORT_STEPFUNCTIONS
+    port = port or config.service_port("stepfunctions")
     backend_port = config.LOCAL_PORT_STEPFUNCTIONS
     install.install_stepfunctions_local()
     cmd = get_command(backend_port)
     log_startup_message("StepFunctions")
     start_proxy_for_service("stepfunctions", port, backend_port, update_listener)
     global PROCESS_THREAD
-    PROCESS_THREAD = do_run(cmd, asynchronous, strip_color=True)
+    # TODO: change ports in stepfunctions.jar, then update here
+    PROCESS_THREAD = do_run(
+        cmd,
+        asynchronous,
+        strip_color=True,
+        env_vars={
+            "EDGE_PORT": config.EDGE_PORT_HTTP or config.EDGE_PORT,
+            "EDGE_PORT_HTTP": config.EDGE_PORT_HTTP or config.EDGE_PORT,
+            "DATA_DIR": config.DATA_DIR,
+        },
+    )
     return PROCESS_THREAD
 
 
 def check_stepfunctions(expect_shutdown=False, print_error=False):
     out = None
     try:
-        # check Kinesis
-        wait_for_port_open(config.LOCAL_PORT_STEPFUNCTIONS)
+        wait_for_port_open(config.LOCAL_PORT_STEPFUNCTIONS, sleep_time=2)
         endpoint_url = f"http://127.0.0.1:{config.LOCAL_PORT_STEPFUNCTIONS}"
         out = aws_stack.connect_to_service(
             service_name="stepfunctions", endpoint_url=endpoint_url
@@ -92,6 +105,8 @@ def check_stepfunctions(expect_shutdown=False, print_error=False):
 
 
 def restart_stepfunctions():
+    if not PROCESS_THREAD:
+        return
     LOG.debug("Restarting StepFunctions process ...")
     PROCESS_THREAD.stop()
     start_stepfunctions(

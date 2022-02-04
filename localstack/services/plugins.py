@@ -218,7 +218,7 @@ class ServiceContainer:
         self.service = service
         self.state = state
         self.lock = threading.RLock()
-        self.errors = list()
+        self.errors = []
 
     def get(self) -> Service:
         return self.service
@@ -258,7 +258,7 @@ class ServiceContainer:
 class ServiceManager:
     def __init__(self) -> None:
         super().__init__()
-        self._services = dict()
+        self._services = {}
         self._mutex = threading.RLock()
 
     def get_service_container(self, name: str) -> Optional[ServiceContainer]:
@@ -288,7 +288,7 @@ class ServiceManager:
             return self.get_service_container(name).check()
 
     def check_all(self):
-        return any([self.check(service_name) for service_name in self.list_available()])
+        return any(self.check(service_name) for service_name in self.list_available())
 
     def get_state(self, name: str) -> Optional[ServiceState]:
         container = self.get_service_container(name)
@@ -419,7 +419,7 @@ class ServicePluginErrorCollector(PluginLifecycleListener):
 
     def __init__(self, errors: Dict[str, Exception] = None) -> None:
         super().__init__()
-        self.errors = errors or dict()
+        self.errors = errors or {}
 
     def get_key(self, plugin_name) -> Tuple[str, str]:
         # the convention is <api>:<provider>, currently we don't really expose the provider
@@ -513,7 +513,7 @@ class ServicePluginManager(ServiceManager):
             return None
 
         with self._mutex:
-            if plugin.service not in self._services:
+            if plugin.service.name() not in self._services:
                 super().add_service(plugin.service)
 
         return super().get_service_container(name)
@@ -575,7 +575,7 @@ class ServicePluginManager(ServiceManager):
         :param provider: Name of the provider
         :return: List of apis the given provider provides
         """
-        apis = list()
+        apis = []
         for api, providers in self.api_provider_specs.items():
             if provider in providers:
                 apis.append(api)

@@ -6,7 +6,8 @@ import socket
 import sys
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
+from urllib.parse import urlparse
 
 if sys.version_info >= (3, 8):
     from typing import TypedDict
@@ -15,9 +16,10 @@ else:
 
 import boto3
 import botocore
+import botocore.config
 from botocore.utils import ArnParser, InvalidArnException
 
-from localstack import config
+from localstack import config, constants
 from localstack.constants import (
     APPLICATION_AMZ_JSON_1_0,
     APPLICATION_AMZ_JSON_1_1,
@@ -57,11 +59,7 @@ LOG = logging.getLogger(__name__)
 # cache local region
 LOCAL_REGION = None
 
-# Use this field if you want to provide a custom boto3 session.
-# This field takes priority over CREATE_NEW_SESSION_PER_BOTO3_CONNECTION
-CUSTOM_BOTO3_SESSION = None
 # Use this flag to enable creation of a new session for each boto3 connection.
-# This flag will be ignored if CUSTOM_BOTO3_SESSION is specified
 CREATE_NEW_SESSION_PER_BOTO3_CONNECTION = False
 
 # Used in AWS assume role function
@@ -177,21 +175,7 @@ class Boto3Session(boto3.session.Session):
             kwargs.pop("endpoint_url")
 
 
-def get_boto3_credentials():
-    global INITIAL_BOTO3_SESSION
-    if CUSTOM_BOTO3_SESSION:
-        return CUSTOM_BOTO3_SESSION.get_credentials()
-    if not INITIAL_BOTO3_SESSION:
-        INITIAL_BOTO3_SESSION = boto3.session.Session()
-    try:
-        return INITIAL_BOTO3_SESSION.get_credentials()
-    except Exception:
-        return boto3.session.Session().get_credentials()
-
-
 def get_boto3_session(cache=True):
-    if cache and CUSTOM_BOTO3_SESSION:
-        return CUSTOM_BOTO3_SESSION
     if not cache or CREATE_NEW_SESSION_PER_BOTO3_CONNECTION:
         return boto3.session.Session()
     # return default session
@@ -209,6 +193,11 @@ def get_region():
     return get_local_region()
 
 
+def get_partition(region_name: str = None):
+    region_name = region_name or get_region()
+    return boto3.session.Session().get_partition_for_region(region_name)
+
+
 def get_local_region():
     global LOCAL_REGION
     if LOCAL_REGION is None:
@@ -221,44 +210,42 @@ def is_internal_call_context(headers):
     """Return whether we are executing in the context of an internal API call, i.e.,
     the case where one API uses a boto3 client to call another API internally."""
     auth_header = headers.get("Authorization") or ""
-    header_value = "Credential=%s/" % INTERNAL_AWS_ACCESS_KEY_ID
-    return header_value in auth_header
+    return get_internal_credential() in auth_header
+
+
+def get_internal_credential():
+    return "Credential=%s/" % INTERNAL_AWS_ACCESS_KEY_ID
 
 
 def set_internal_auth(headers):
     authorization = headers.get("Authorization") or ""
-    authorization = re.sub(
-        r"Credential=[^/]+/",
-        "Credential=%s/" % INTERNAL_AWS_ACCESS_KEY_ID,
-        authorization,
-    )
     if authorization.startswith("AWS "):
+        # Cover Non HMAC Authentication
         authorization = re.sub(
-            r"AWS [^/]+",  # Cover Non HMAC Authentication
-            "Credential=%s" % INTERNAL_AWS_ACCESS_KEY_ID,
+            r"AWS [^/]+",
+            "AWS %s" % get_internal_credential(),
             authorization,
         )
     else:
         authorization = re.sub(
             r"Credential=[^/]+/",
-            "Credential=%s/" % INTERNAL_AWS_ACCESS_KEY_ID,
+            get_internal_credential(),
             authorization,
         )
     headers["Authorization"] = authorization
     return headers
 
 
-def get_local_service_url(service_name_or_port):
+def get_local_service_url(service_name_or_port: Union[str, int]) -> str:
     """Return the local service URL for the given service name or port."""
     if isinstance(service_name_or_port, int):
-        return "%s://%s:%s" % (get_service_protocol(), LOCALHOST, service_name_or_port)
+        return f"{get_service_protocol()}://{LOCALHOST}:{service_name_or_port}"
     service_name = service_name_or_port
     if service_name == "s3api":
         service_name = "s3"
     elif service_name == "runtime.sagemaker":
         service_name = "sagemaker-runtime"
-    service_name_upper = service_name.upper().replace("-", "_").replace(".", "_")
-    return os.environ["TEST_%s_URL" % service_name_upper]
+    return config.service_url(service_name)
 
 
 def connect_to_resource(
@@ -346,6 +333,34 @@ def connect_to_service(
         return new_client
 
 
+def create_external_boto_client(
+    service_name,
+    client=True,
+    env=None,
+    region_name=None,
+    endpoint_url=None,
+    config: botocore.config.Config = None,
+    verify=False,
+    cache=True,
+    *args,
+    **kwargs,
+):
+    return connect_to_service(
+        service_name,
+        client,
+        env,
+        region_name,
+        endpoint_url,
+        config,
+        verify,
+        cache,
+        aws_access_key_id="__test_call__",
+        aws_secret_access_key="__test_key__",
+        *args,
+        **kwargs,
+    )
+
+
 def get_s3_hostname():
     global CACHE_S3_HOSTNAME_DNS_STATUS
     if CACHE_S3_HOSTNAME_DNS_STATUS is None:
@@ -365,20 +380,16 @@ def render_velocity_template(*args, **kwargs):
 
 
 def generate_presigned_url(*args, **kwargs):
-    id_before = os.environ.get(ENV_ACCESS_KEY)
-    key_before = os.environ.get(ENV_SECRET_KEY)
     endpoint_url = kwargs.pop("endpoint_url", None)
-    try:
-        # Note: presigned URL needs to be created with test credentials
-        os.environ[ENV_ACCESS_KEY] = TEST_AWS_ACCESS_KEY_ID
-        os.environ[ENV_SECRET_KEY] = TEST_AWS_SECRET_ACCESS_KEY
-        s3_client = connect_to_service("s3", endpoint_url=endpoint_url, cache=False)
-        return s3_client.generate_presigned_url(*args, **kwargs)
-    finally:
-        if id_before:
-            os.environ[ENV_ACCESS_KEY] = id_before
-        if key_before:
-            os.environ[ENV_SECRET_KEY] = key_before
+    s3_client = connect_to_service(
+        "s3",
+        endpoint_url=endpoint_url,
+        cache=False,
+        # Note: presigned URL needs to be created with (external) test credentials
+        aws_access_key_id=TEST_AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=TEST_AWS_SECRET_ACCESS_KEY,
+    )
+    return s3_client.generate_presigned_url(*args, **kwargs)
 
 
 def check_valid_region(headers):
@@ -693,7 +704,7 @@ def fix_arn(arn):
         parts = arn.split(":")
         region = parts[3] if parts[3] in config.VALID_REGIONS else get_region()
         return lambda_function_arn(lambda_function_name(arn), region_name=region)
-    LOG.warning("Unable to fix/canonicalize ARN: %s" % arn)
+    LOG.warning("Unable to fix/canonicalize ARN: %s", arn)
     return arn
 
 
@@ -730,6 +741,12 @@ def kms_key_arn(key_id: str, account_id: str = None, region_name: str = None) ->
 def code_signing_arn(code_signing_id: str, account_id: str = None, region_name: str = None) -> str:
     pattern = "arn:aws:lambda:%s:%s:code-signing-config:%s"
     return _resource_arn(code_signing_id, pattern, account_id=account_id, region_name=region_name)
+
+
+def ssm_parameter_arn(param_name: str, account_id: str = None, region_name: str = None) -> str:
+    pattern = "arn:aws:ssm:%s:%s:parameter/%s"
+    param_name = param_name.lstrip("/")
+    return _resource_arn(param_name, pattern, account_id=account_id, region_name=region_name)
 
 
 def s3_bucket_arn(bucket_name_or_arn: str, account_id=None):
@@ -818,7 +835,8 @@ def mock_aws_request_headers(service="dynamodb", region_name=None, access_key=No
     elif service in ["sns", "sqs"]:
         ctype = APPLICATION_X_WWW_FORM_URLENCODED
 
-    access_key = access_key or get_boto3_credentials().access_key
+    # TODO: consider adding an internal=False flag, to use INTERNAL_AWS_ACCESS_KEY_ID for internal calls here
+    access_key = access_key or constants.TEST_AWS_ACCESS_KEY_ID
     region_name = region_name or get_region()
     headers = {
         "Content-Type": ctype,
@@ -840,14 +858,13 @@ def inject_region_into_auth_headers(region, headers):
         regex = r"Credential=([^/]+)/([^/]+)/([^/]+)/"
         auth_header = re.sub(regex, r"Credential=\1/\2/%s/" % region, auth_header)
         headers["Authorization"] = auth_header
-    return headers
 
 
 def dynamodb_get_item_raw(request):
     headers = mock_aws_request_headers()
     headers["X-Amz-Target"] = "DynamoDB_20120810.GetItem"
     new_item = make_http_request(
-        url=config.TEST_DYNAMODB_URL,
+        url=config.service_url("dynamodb"),
         method="POST",
         data=json.dumps(request),
         headers=headers,
@@ -964,19 +981,21 @@ def create_api_gateway(
     description=None,
     resources=None,
     stage_name=None,
-    enabled_api_keys=[],
+    enabled_api_keys=None,
     env=None,
     usage_plan_name=None,
     region_name=None,
     auth_creator_func=None,  # function that receives an api_id and returns an authorizer_id
 ):
+    if enabled_api_keys is None:
+        enabled_api_keys = []
     client = connect_to_service("apigateway", env=env, region_name=region_name)
     resources = resources or []
     stage_name = stage_name or "testing"
     usage_plan_name = usage_plan_name or "Basic Usage"
     description = description or 'Test description for API "%s"' % name
 
-    LOG.info('Creating API resources under API Gateway "%s".' % name)
+    LOG.info('Creating API resources under API Gateway "%s".', name)
     api = client.create_rest_api(name=name, description=description)
     api_id = api["id"]
 
@@ -1023,8 +1042,10 @@ def create_api_gateway(
 
 
 def create_api_gateway_integrations(
-    api_id, resource_id, method, integrations=[], env=None, region_name=None
+    api_id, resource_id, method, integrations=None, env=None, region_name=None
 ):
+    if integrations is None:
+        integrations = []
     client = connect_to_service("apigateway", env=env, region_name=region_name)
     for integration in integrations:
         req_templates = integration.get("requestTemplates") or {}
@@ -1076,44 +1097,41 @@ def apigateway_invocations_arn(lambda_uri):
     )
 
 
-def get_elasticsearch_endpoint(domain=None, region_name=None):
-    env = get_environment(region_name=region_name)
-    if is_local_env(env):
-        return os.environ["TEST_ELASTICSEARCH_URL"]
+def get_elasticsearch_endpoint(region_name: str, domain_arn: str = None):
+    if not domain_arn:
+        return config.service_url("elasticsearch")
     # get endpoint from API
-    es_client = connect_to_service(service_name="es", region_name=env.region)
-    info = es_client.describe_elasticsearch_domain(DomainName=domain)
-    endpoint = "https://%s" % info["DomainStatus"]["Endpoint"]
+    es_client = connect_to_service(service_name="es", region_name=region_name)
+    domain_name = domain_arn.rpartition("/")[2]
+    info = es_client.describe_elasticsearch_domain(DomainName=domain_name)
+    base_domain = info["DomainStatus"]["Endpoint"]
+    endpoint = base_domain if base_domain.startswith("http") else f"https://{base_domain}"
     return endpoint
 
 
-def connect_elasticsearch(endpoint=None, domain=None, region_name=None, env=None):
+def connect_elasticsearch(endpoint: str = None, domain: str = None, region_name: str = None):
     from elasticsearch import Elasticsearch, RequestsHttpConnection
     from requests_aws4auth import AWS4Auth
 
-    env = get_environment(env, region_name=region_name)
+    region = region_name or get_region()
     verify_certs = False
     use_ssl = False
-    if not endpoint and is_local_env(env):
-        endpoint = os.environ["TEST_ELASTICSEARCH_URL"]
-    if not endpoint and not is_local_env(env) and domain:
-        endpoint = get_elasticsearch_endpoint(domain=domain, region_name=env.region)
+    if not endpoint:
+        endpoint = get_elasticsearch_endpoint(domain_arn=domain, region_name=region)
     # use ssl?
     if "https://" in endpoint:
         use_ssl = True
-        if not is_local_env(env):
+        # TODO remove this condition once ssl certs are available for .es.localhost.localstack.cloud domains
+        endpoint_netloc = urlparse(endpoint).netloc
+        if not re.match(r"^.*(localhost(\.localstack\.cloud)?)(:\d+)?$", endpoint_netloc):
             verify_certs = True
 
-    if CUSTOM_BOTO3_SESSION or (ENV_ACCESS_KEY in os.environ and ENV_SECRET_KEY in os.environ):
+    LOG.debug("Creating ES client with endpoint %s", endpoint)
+    if ENV_ACCESS_KEY in os.environ and ENV_SECRET_KEY in os.environ:
         access_key = os.environ.get(ENV_ACCESS_KEY)
         secret_key = os.environ.get(ENV_SECRET_KEY)
         session_token = os.environ.get(ENV_SESSION_TOKEN)
-        if CUSTOM_BOTO3_SESSION:
-            credentials = CUSTOM_BOTO3_SESSION.get_credentials()
-            access_key = credentials.access_key
-            secret_key = credentials.secret_key
-            session_token = credentials.token
-        awsauth = AWS4Auth(access_key, secret_key, env.region, "es", session_token=session_token)
+        awsauth = AWS4Auth(access_key, secret_key, region, "es", session_token=session_token)
         connection_class = RequestsHttpConnection
         return Elasticsearch(
             hosts=[endpoint],

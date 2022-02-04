@@ -21,7 +21,7 @@ RESOURCE_POLICY = {
 
 class SecretsManagerTest(unittest.TestCase):
     def setUp(self):
-        self.secretsmanager_client = aws_stack.connect_to_service("secretsmanager")
+        self.secretsmanager_client = aws_stack.create_external_boto_client("secretsmanager")
 
     def test_create_and_update_secret(self):
         secret_name = "s-%s" % short_uid()
@@ -126,7 +126,7 @@ class SecretsManagerTest(unittest.TestCase):
         )
 
         self.assertEqual(120, len(random_password["RandomPassword"]))
-        self.assertTrue(all([c not in "xyzDje@?!." for c in random_password["RandomPassword"]]))
+        self.assertTrue(all(c not in "xyzDje@?!." for c in random_password["RandomPassword"]))
 
     def test_resource_policy(self):
         secret_name = "s-%s" % short_uid()

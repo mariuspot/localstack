@@ -5,7 +5,7 @@ from localstack.utils.aws import aws_stack
 
 class TestEc2Integrations(unittest.TestCase):
     def setUp(self):
-        self.ec2_client = aws_stack.connect_to_service("ec2")
+        self.ec2_client = aws_stack.create_external_boto_client("ec2")
 
     def test_create_route_table_association(self):
         ec2 = self.ec2_client
@@ -21,12 +21,15 @@ class TestEc2Integrations(unittest.TestCase):
         for route_tables in ec2.describe_route_tables()["RouteTables"]:
             for association in route_tables["Associations"]:
                 if association["RouteTableId"] == route_table["RouteTable"]["RouteTableId"]:
+                    if association.get("Main"):
+                        continue  # default route table associations have no SubnetId in moto
                     self.assertEqual(association["SubnetId"], subnet["Subnet"]["SubnetId"])
                     self.assertEqual(association["AssociationState"]["State"], "associated")
 
         ec2.disassociate_route_table(AssociationId=association_id)
         for route_tables in ec2.describe_route_tables()["RouteTables"]:
-            self.assertEqual(route_tables["Associations"], [])
+            associations = [a for a in route_tables["Associations"] if not a.get("Main")]
+            self.assertEqual(associations, [])
 
     def test_create_vpc_end_point(self):
         ec2 = self.ec2_client
@@ -112,8 +115,8 @@ class TestEc2Integrations(unittest.TestCase):
     def test_vcp_peering_difference_regions(self):
         # Note: different regions currently not supported due to set_default_region_in_headers(..) in edge.py
         region1 = region2 = aws_stack.get_region()
-        ec2_client1 = aws_stack.connect_to_service(service_name="ec2", region_name=region1)
-        ec2_client2 = aws_stack.connect_to_service(service_name="ec2", region_name=region2)
+        ec2_client1 = aws_stack.create_external_boto_client(service_name="ec2", region_name=region1)
+        ec2_client2 = aws_stack.create_external_boto_client(service_name="ec2", region_name=region2)
 
         cidr_block1 = "192.168.1.2/24"
         cidr_block2 = "192.168.1.2/24"
@@ -220,6 +223,53 @@ class TestEc2Integrations(unittest.TestCase):
         # clean up
         ec2.detach_vpn_gateway(VpcId=vpc_id, VpnGatewayId=gateway_id)
         ec2.delete_vpn_gateway(VpnGatewayId=gateway_id)
+        ec2.delete_vpc(VpcId=vpc_id)
+
+    def test_describe_vpc_endpoints_with_filter(self):
+
+        ec2 = self.ec2_client
+        vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+        vpc_id = vpc["Vpc"]["VpcId"]
+
+        # test filter of Gateway endpoint services
+        vpc_endpoint_gateway_services = ec2.describe_vpc_endpoint_services(
+            Filters=[
+                {"Name": "service-type", "Values": ["Gateway"]},
+            ],
+        )
+
+        region = aws_stack.get_region()
+        self.assertEqual(200, vpc_endpoint_gateway_services["ResponseMetadata"]["HTTPStatusCode"])
+        services = vpc_endpoint_gateway_services["ServiceNames"]
+        self.assertEqual(2, len(services))
+        self.assertTrue(f"com.amazonaws.{region}.dynamodb" in services)
+        self.assertTrue(f"com.amazonaws.{region}.s3" in services)
+        # test filter of Interface endpoint services
+        vpc_endpoint_interface_services = ec2.describe_vpc_endpoint_services(
+            Filters=[
+                {"Name": "service-type", "Values": ["Interface"]},
+            ],
+        )
+
+        self.assertEqual(200, vpc_endpoint_interface_services["ResponseMetadata"]["HTTPStatusCode"])
+        services = vpc_endpoint_interface_services["ServiceNames"]
+        self.assertTrue(len(services) > 0)
+        self.assertTrue(f"com.amazonaws.{region}.dynamodb" in services)
+        self.assertTrue(f"com.amazonaws.{region}.s3" in services)
+        self.assertTrue(f"com.amazonaws.{region}.firehose" in services)
+
+        # test filter that does not exist
+        vpc_endpoint_interface_services = ec2.describe_vpc_endpoint_services(
+            Filters=[
+                {"Name": "service-type", "Values": ["fake"]},
+            ],
+        )
+
+        self.assertEqual(200, vpc_endpoint_interface_services["ResponseMetadata"]["HTTPStatusCode"])
+        services = vpc_endpoint_interface_services["ServiceNames"]
+        self.assertTrue(len(services) == 0)
+
+        # clean up
         ec2.delete_vpc(VpcId=vpc_id)
 
     def test_terminate_instances(self):

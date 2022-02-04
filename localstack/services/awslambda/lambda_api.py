@@ -12,32 +12,37 @@ import time
 import traceback
 import uuid
 from datetime import datetime
-from io import BytesIO
+from io import StringIO
 from threading import BoundedSemaphore
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple, Type
+from urllib.parse import urlparse
 
 from flask import Flask, Response, jsonify, request
-from six.moves import cStringIO as StringIO
-from six.moves.urllib.parse import urlparse
 
 from localstack import config
-from localstack.constants import APPLICATION_JSON, TEST_AWS_ACCOUNT_ID
+from localstack.constants import APPLICATION_JSON, LAMBDA_TEST_ROLE, TEST_AWS_ACCOUNT_ID
 from localstack.services.awslambda import lambda_executors
-from localstack.services.awslambda.lambda_executors import LambdaContext
+from localstack.services.awslambda.lambda_executors import InvocationResult, LambdaContext
 from localstack.services.awslambda.lambda_utils import (
     API_PATH_ROOT,
     DOTNET_LAMBDA_RUNTIMES,
     LAMBDA_DEFAULT_HANDLER,
     LAMBDA_DEFAULT_RUNTIME,
     LAMBDA_DEFAULT_STARTING_POSITION,
+    LAMBDA_RUNTIME_NODEJS14X,
+    ClientError,
+    error_response,
+    event_source_arn_matches,
     get_handler_file_from_name,
     get_lambda_runtime,
+    get_zip_bytes,
     multi_value_dict_for_list,
 )
 from localstack.services.generic_proxy import RegionBackend
-from localstack.services.install import install_go_lambda_runtime
+from localstack.services.install import INSTALL_DIR_STEPFUNCTIONS, install_go_lambda_runtime
+from localstack.utils import bootstrap
 from localstack.utils.analytics import event_publisher
-from localstack.utils.aws import aws_responses, aws_stack
+from localstack.utils.aws import aws_stack
 from localstack.utils.aws.aws_models import CodeSigningConfig, LambdaFunction
 from localstack.utils.aws.aws_responses import ResourceNotFoundException
 from localstack.utils.common import (
@@ -45,7 +50,6 @@ from localstack.utils.common import (
     empty_context_manager,
     ensure_readable,
     first_char_to_lower,
-    get_all_subclasses,
     is_zip_file,
     isoformat_milliseconds,
     json_safe,
@@ -67,6 +71,7 @@ from localstack.utils.common import (
     unzip,
 )
 from localstack.utils.docker_utils import DOCKER_CLIENT
+from localstack.utils.generic.singleton_utils import SubtypesInstanceManager
 from localstack.utils.http_utils import canonicalize_headers, parse_chunked_data
 from localstack.utils.run import FuncThread
 
@@ -77,8 +82,8 @@ LOG = logging.getLogger(__name__)
 LAMBDA_POLICY_NAME_PATTERN = "lambda_policy_{name}_{qualifier}"
 # constants
 APP_NAME = "lambda_api"
-ARCHIVE_FILE_PATTERN = "%s/lambda.handler.*.jar" % config.TMP_FOLDER
-LAMBDA_SCRIPT_PATTERN = "%s/lambda_script_*.py" % config.TMP_FOLDER
+ARCHIVE_FILE_PATTERN = "%s/lambda.handler.*.jar" % config.dirs.tmp
+LAMBDA_SCRIPT_PATTERN = "%s/lambda_script_*.py" % config.dirs.tmp
 LAMBDA_ZIP_FILE_NAME = "original_lambda_archive.zip"
 LAMBDA_JAR_FILE_NAME = "original_lambda_archive.jar"
 
@@ -86,7 +91,7 @@ LAMBDA_JAR_FILE_NAME = "original_lambda_archive.jar"
 LAMBDA_DEFAULT_TIMEOUT = 3
 
 INVALID_PARAMETER_VALUE_EXCEPTION = "InvalidParameterValueException"
-VERSION_LATEST = "$LATEST"
+VERSION_LATEST = LambdaFunction.QUALIFIER_LATEST
 FUNCTION_MAX_SIZE = 69905067
 
 BATCH_SIZE_RANGES = {
@@ -148,28 +153,8 @@ class LambdaRegion(RegionBackend):
         self.event_source_mappings = []
 
 
-class ClientError(Exception):
-    def __init__(self, msg, code=400):
-        super(ClientError, self).__init__(msg)
-        self.code = code
-        self.msg = msg
-
-    def get_response(self):
-        if isinstance(self.msg, Response):
-            return self.msg
-        return error_response(self.msg, self.code)
-
-
-class EventSourceListener:
+class EventSourceListener(SubtypesInstanceManager):
     INSTANCES: Dict[str, "EventSourceListener"] = {}
-
-    @classmethod
-    def get(cls, source_type):
-        # TODO: potentially to be replaced with new plugin loading mechanism...
-        if not cls.INSTANCES:
-            for clazz in get_all_subclasses(EventSourceListener):
-                cls.INSTANCES[clazz.source_type()] = clazz()
-        return cls.INSTANCES.get(source_type)
 
     @staticmethod
     def source_type() -> str:
@@ -195,14 +180,14 @@ class EventSourceListener:
             )
             if self_managed_endpoints.get("KAFKA_BOOTSTRAP_SERVERS"):
                 service_type = "kafka"
-        instance = EventSourceListener.get(service_type)
+        instance = EventSourceListener.get(service_type, raise_if_missing=False)
         if instance:
             instance.start()
 
     @staticmethod
     def process_event_via_listener(service_type: str, event: Any):
         """Process event for the given service type (for reactive mode)"""
-        instance = EventSourceListener.get(service_type)
+        instance = EventSourceListener.get(service_type, raise_if_missing=False)
         if not instance:
             return
 
@@ -211,6 +196,14 @@ class EventSourceListener:
 
         # start processing in background
         start_worker_thread(_process)
+
+    @classmethod
+    def impl_name(cls) -> str:
+        return cls.source_type()
+
+    @classmethod
+    def get_base_type(cls) -> Type:
+        return EventSourceListener
 
 
 class EventSourceListenerSQS(EventSourceListener):
@@ -253,8 +246,10 @@ class EventSourceListenerSQS(EventSourceListener):
                 return False
 
             LOG.debug(
-                "Found %s source mappings for event from SQS queue %s: %s"
-                % (len(arns), queue_arn, arns)
+                "Found %s source mappings for event from SQS queue %s: %s",
+                len(arns),
+                queue_arn,
+                arns,
             )
             # TODO: support message BatchSize here, same as for polling mode below
             messages = event["Messages"]
@@ -302,9 +297,7 @@ class EventSourceListenerSQS(EventSourceListener):
                     except Exception as e:
                         if "NonExistentQueue" not in str(e):
                             # TODO: remove event source if queue does no longer exist?
-                            LOG.debug(
-                                "Unable to poll SQS messages for queue %s: %s" % (queue_arn, e)
-                            )
+                            LOG.debug("Unable to poll SQS messages for queue %s: %s", queue_arn, e)
 
             except Exception:
                 pass
@@ -316,7 +309,7 @@ class EventSourceListenerSQS(EventSourceListener):
         queue_arn = source["EventSourceArn"]
         region_name = queue_arn.split(":")[3]
         queue_url = aws_stack.sqs_queue_url_for_arn(queue_arn)
-        LOG.debug("Sending event from event source %s to Lambda %s" % (queue_arn, lambda_arn))
+        LOG.debug("Sending event from event source %s to Lambda %s", queue_arn, lambda_arn)
         res = self._send_event_to_lambda(
             queue_arn,
             queue_url,
@@ -376,7 +369,7 @@ class EventSourceListenerSQS(EventSourceListener):
             asynchronous=True,
             callback=delete_messages,
         )
-        if isinstance(res, lambda_executors.InvocationResult):
+        if isinstance(res, InvocationResult):
             status_code = getattr(res.result, "status_code", 0)
             if status_code >= 400:
                 return False
@@ -517,8 +510,8 @@ def use_docker():
                         "Lambda executor configured as LAMBDA_EXECUTOR=%s but Docker "
                         "is not accessible. Please make sure to mount the Docker socket "
                         "/var/run/docker.sock into the container."
-                    )
-                    % config.LAMBDA_EXECUTOR
+                    ),
+                    config.LAMBDA_EXECUTOR,
                 )
             DO_USE_DOCKER = has_docker
     return DO_USE_DOCKER
@@ -543,22 +536,31 @@ def message_attributes_to_lower(message_attrs):
     return message_attrs
 
 
+# TODO - refactor to use ApiInvocationContext as input
 def process_apigateway_invocation(
     func_arn,
     path,
     payload,
     stage,
     api_id,
-    headers={},
+    headers=None,
     is_base64_encoded=False,
     resource_path=None,
     method=None,
-    path_params={},
+    path_params=None,
     query_string_params=None,
-    stage_variables={},
-    request_context={},
-    event_context={},
+    stage_variables=None,
+    request_context=None,
+    event_context=None,
 ):
+    if path_params is None:
+        path_params = {}
+    if stage_variables is None:
+        stage_variables = {}
+    if request_context is None:
+        request_context = {}
+    if event_context is None:
+        event_context = {}
     try:
         resource_path = resource_path or path
         event = construct_invocation_event(
@@ -572,8 +574,10 @@ def process_apigateway_invocation(
         if stage_variables:
             event["stageVariables"] = stage_variables
         LOG.debug(
-            "Running Lambda function %s from API Gateway invocation: %s %s"
-            % (func_arn, method or "GET", path)
+            "Running Lambda function %s from API Gateway invocation: %s %s",
+            func_arn,
+            method or "GET",
+            path,
         )
         asynchronous = not config.SYNCHRONOUS_API_GATEWAY_EVENTS
         inv_result = run_lambda(
@@ -585,13 +589,12 @@ def process_apigateway_invocation(
         return inv_result.result
     except Exception as e:
         LOG.warning(
-            "Unable to run Lambda function on API Gateway message: %s %s"
-            % (e, traceback.format_exc())
+            "Unable to run Lambda function on API Gateway message: %s %s", e, traceback.format_exc()
         )
 
 
 def construct_invocation_event(
-    method, path, headers, data, query_string_params={}, is_base64_encoded=False
+    method, path, headers, data, query_string_params=None, is_base64_encoded=False
 ):
     query_string_params = query_string_params or parse_request_data(method, path, "")
     # AWS canonicalizes header names, converting them to lower-case
@@ -698,7 +701,7 @@ def process_kinesis_records(records, stream_name):
                 )
     except Exception as e:
         LOG.warning(
-            "Unable to run Lambda function on Kinesis records: %s %s" % (e, traceback.format_exc())
+            "Unable to run Lambda function on Kinesis records: %s %s", e, traceback.format_exc()
         )
 
 
@@ -707,28 +710,9 @@ def get_event_sources(func_name=None, source_arn=None):
     for region, details in LambdaRegion.regions().items():
         for m in details.event_source_mappings:
             if not func_name or (m["FunctionArn"] in [func_name, func_arn(func_name)]):
-                if _arn_match(mapped=m.get("EventSourceArn"), searched=source_arn):
+                if event_source_arn_matches(mapped=m.get("EventSourceArn"), searched=source_arn):
                     result.append(m)
     return result
-
-
-def _arn_match(mapped, searched):
-    if not mapped:
-        return False
-    if not searched or mapped == searched:
-        return True
-    # Some types of ARNs can end with a path separated by slashes, for
-    # example the ARN of a DynamoDB stream is tableARN/stream/ID. It's
-    # a little counterintuitive that a more specific mapped ARN can
-    # match a less specific ARN on the event, but some integration tests
-    # rely on it for things like subscribing to a stream and matching an
-    # event labeled with the table ARN.
-    if re.match(r"^%s$" % searched, mapped):
-        return True
-    if mapped.startswith(searched):
-        suffix = mapped[len(searched) :]
-        return suffix[0] == "/"
-    return False
 
 
 def get_function_version(arn, version):
@@ -782,13 +766,15 @@ def do_update_alias(arn, alias, version, description=None):
 def run_lambda(
     func_arn,
     event,
-    context={},
+    context=None,
     version=None,
     suppress_output=False,
     asynchronous=False,
     callback=None,
     lock_discriminator: str = None,
-):
+) -> InvocationResult:
+    if context is None:
+        context = {}
     region_name = func_arn.split(":")[3]
     region = LambdaRegion.get(region_name)
     if suppress_output:
@@ -801,9 +787,9 @@ def run_lambda(
         func_arn = aws_stack.fix_arn(func_arn)
         lambda_function = region.lambdas.get(func_arn)
         if not lambda_function:
-            LOG.debug("Unable to find details for Lambda %s in region %s" % (func_arn, region_name))
+            LOG.debug("Unable to find details for Lambda %s in region %s", func_arn, region_name)
             result = not_found_error(msg="The resource specified in the request does not exist.")
-            return lambda_executors.InvocationResult(result)
+            return InvocationResult(result)
 
         context = LambdaContext(lambda_function, version, context)
         result = LAMBDA_EXECUTOR.execute(
@@ -820,18 +806,15 @@ def run_lambda(
 
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
+        # TODO: wrong mapping
         response = {
             "errorType": str(exc_type.__name__),
             "errorMessage": str(e),
             "stackTrace": traceback.format_tb(exc_traceback),
         }
-        LOG.info(
-            "Error executing Lambda function %s: %s %s" % (func_arn, e, traceback.format_exc())
-        )
+        LOG.info("Error executing Lambda function %s: %s %s", func_arn, e, traceback.format_exc())
         log_output = e.log_output if isinstance(e, lambda_executors.InvocationException) else ""
-        return lambda_executors.InvocationResult(
-            Response(json.dumps(response), status=500), log_output
-        )
+        return InvocationResult(Response(json.dumps(response), status=500), log_output)
     finally:
         if suppress_output:
             sys.stdout = stdout_
@@ -880,7 +863,7 @@ def exec_lambda_code(script, handler_function="handler", lambda_cwd=None, lambda
                     if key not in pre_sys_modules_keys:
                         sys.modules.pop(key)
         except Exception as e:
-            LOG.error("Unable to exec: %s %s" % (script, traceback.format_exc()))
+            LOG.error("Unable to exec: %s %s", script, traceback.format_exc())
             raise e
         finally:
             if lambda_cwd or lambda_env:
@@ -901,37 +884,6 @@ def get_handler_function_from_name(handler_name, runtime=None):
     if runtime.startswith(tuple(DOTNET_LAMBDA_RUNTIMES)):
         return handler_name.split(":")[-1]
     return handler_name.split(".")[-1]
-
-
-def error_response(msg, code=500, error_type="InternalFailure"):
-    LOG.debug(msg)
-    return aws_responses.flask_error_response_json(msg, code=code, error_type=error_type)
-
-
-def get_zip_bytes(function_code):
-    """Returns the ZIP file contents from a FunctionCode dict.
-
-    :type function_code: dict
-    :param function_code: https://docs.aws.amazon.com/lambda/latest/dg/API_FunctionCode.html
-    :returns: bytes of the Zip file.
-    """
-    function_code = function_code or {}
-    if "S3Bucket" in function_code:
-        s3_client = aws_stack.connect_to_service("s3")
-        bytes_io = BytesIO()
-        try:
-            s3_client.download_fileobj(function_code["S3Bucket"], function_code["S3Key"], bytes_io)
-            zip_file_content = bytes_io.getvalue()
-        except Exception as e:
-            raise ClientError("Unable to fetch Lambda archive from S3: %s" % e, 404)
-    elif "ZipFile" in function_code:
-        zip_file_content = function_code["ZipFile"]
-        zip_file_content = base64.b64decode(zip_file_content)
-    elif "ImageUri" in function_code:
-        zip_file_content = None
-    else:
-        raise ClientError("No valid Lambda archive specified: %s" % list(function_code.keys()))
-    return zip_file_content
 
 
 def get_java_handler(zip_file_content, main_file, lambda_function=None):
@@ -965,7 +917,7 @@ def get_java_handler(zip_file_content, main_file, lambda_function=None):
     )
 
 
-def set_archive_code(code, lambda_name, zip_file_content=None):
+def set_archive_code(code: Dict, lambda_name: str, zip_file_content: bytes = None) -> Optional[str]:
     region = LambdaRegion.get()
     # get metadata
     lambda_arn = func_arn(lambda_name)
@@ -998,7 +950,7 @@ def set_archive_code(code, lambda_name, zip_file_content=None):
     latest_version = lambda_details.get_version(VERSION_LATEST)
     latest_version["CodeSize"] = len(zip_file_content)
     latest_version["CodeSha256"] = code_sha_256.decode("utf-8")
-    tmp_dir = "%s/zipfile.%s" % (config.TMP_FOLDER, short_uid())
+    tmp_dir = "%s/zipfile.%s" % (config.dirs.tmp, short_uid())
     mkdir(tmp_dir)
     tmp_file = "%s/%s" % (tmp_dir, LAMBDA_ZIP_FILE_NAME)
     save_file(tmp_file, zip_file_content)
@@ -1009,8 +961,7 @@ def set_archive_code(code, lambda_name, zip_file_content=None):
 
 def set_function_code(lambda_function: LambdaFunction):
     def _set_and_configure():
-        lambda_handler = do_set_function_code(lambda_function)
-        lambda_function.versions.get(VERSION_LATEST)["Function"] = lambda_handler
+        do_set_function_code(lambda_function)
         # initialize function code via plugins
         for plugin in lambda_executors.LambdaExecutorPlugin.get_plugins():
             plugin.init_function_code(lambda_function)
@@ -1020,7 +971,43 @@ def set_function_code(lambda_function: LambdaFunction):
     return {"FunctionName": lambda_function.name()}
 
 
+def store_and_get_lambda_code_archive(
+    lambda_function: LambdaFunction, zip_file_content: bytes = None
+) -> Optional[Tuple[str, str, bytes]]:
+    """Store the Lambda code referenced in the LambdaFunction details to disk as a zip file,
+    and return the Lambda CWD, file name, and zip bytes content. May optionally return None
+    in case this is a Lambda with the special bucket marker __local__, used for code mounting."""
+    code_passed = lambda_function.code
+    is_local_mount = code_passed.get("S3Bucket") == config.BUCKET_MARKER_LOCAL
+    lambda_cwd = lambda_function.cwd
+
+    if code_passed:
+        lambda_cwd = lambda_cwd or set_archive_code(code_passed, lambda_function.name())
+        if not zip_file_content and not is_local_mount:
+            # Save the zip file to a temporary file that the lambda executors can reference
+            zip_file_content = get_zip_bytes(code_passed)
+    else:
+        lambda_details = LambdaRegion.get().lambdas[lambda_function.arn()]
+        lambda_cwd = lambda_cwd or lambda_details.cwd
+
+    if not lambda_cwd:
+        return
+
+    # construct archive name
+    archive_file = os.path.join(lambda_cwd, LAMBDA_ZIP_FILE_NAME)
+
+    if not zip_file_content:
+        zip_file_content = load_file(archive_file, mode="rb")
+    else:
+        # override lambda archive with fresh code if we got an update
+        save_file(archive_file, zip_file_content)
+    return lambda_cwd, archive_file, zip_file_content
+
+
 def do_set_function_code(lambda_function: LambdaFunction):
+    """Main function that creates the local zip archive for the given Lambda function, and
+    optionally creates the handler function references (for LAMBDA_EXECUTOR=local)"""
+
     def generic_handler(*_):
         raise ClientError(
             (
@@ -1030,41 +1017,24 @@ def do_set_function_code(lambda_function: LambdaFunction):
             % lambda_name
         )
 
-    region = LambdaRegion.get()
     lambda_name = lambda_function.name()
     arn = lambda_function.arn()
-    lambda_details = region.lambdas[arn]
-    runtime = get_lambda_runtime(lambda_details)
-    lambda_environment = lambda_details.envvars
-    handler_name = lambda_details.handler = lambda_details.handler or LAMBDA_DEFAULT_HANDLER
+    runtime = get_lambda_runtime(lambda_function)
+    lambda_environment = lambda_function.envvars
+    handler_name = lambda_function.handler = lambda_function.handler or LAMBDA_DEFAULT_HANDLER
     code_passed = lambda_function.code
     is_local_mount = code_passed.get("S3Bucket") == config.BUCKET_MARKER_LOCAL
-    zip_file_content = None
-    lambda_cwd = lambda_function.cwd
 
+    # cleanup any left-over Lambda executor instances
     LAMBDA_EXECUTOR.cleanup(arn)
 
-    if code_passed:
-        lambda_cwd = lambda_cwd or set_archive_code(code_passed, lambda_name)
-        if not is_local_mount:
-            # Save the zip file to a temporary file that the lambda executors can reference
-            zip_file_content = get_zip_bytes(code_passed)
-    else:
-        lambda_cwd = lambda_cwd or lambda_details.cwd
-
-    if not lambda_cwd:
+    # get local Lambda code archive path
+    _result = store_and_get_lambda_code_archive(lambda_function)
+    if not _result:
         return
+    lambda_cwd, archive_file, zip_file_content = _result
 
-    # get local lambda code archive path
-    tmp_file = os.path.join(lambda_cwd, LAMBDA_ZIP_FILE_NAME)
-
-    if not zip_file_content:
-        zip_file_content = load_file(tmp_file, mode="rb")
-    else:
-        # override lambda archive with fresh code if we got an update
-        save_file(tmp_file, zip_file_content)
-
-    # Set the appropriate lambda handler.
+    # Set the appropriate Lambda handler.
     lambda_handler = generic_handler
     is_java = lambda_executors.is_java_lambda(runtime)
 
@@ -1074,7 +1044,7 @@ def do_set_function_code(lambda_function: LambdaFunction):
         # directory as part of the classpath. Obtain a Java handler function below.
         try:
             lambda_handler = get_java_handler(
-                zip_file_content, tmp_file, lambda_function=lambda_details
+                zip_file_content, archive_file, lambda_function=lambda_function
             )
         except Exception as e:
             # this can happen, e.g., for Lambda code mounted via __local__ -> ignore
@@ -1083,16 +1053,13 @@ def do_set_function_code(lambda_function: LambdaFunction):
     if not is_local_mount:
         # Lambda code must be uploaded in Zip format
         if not is_zip_file(zip_file_content):
-            raise ClientError(
-                "Uploaded Lambda code for runtime ({}) is not in Zip format".format(runtime)
-            )
+            raise ClientError(f"Uploaded Lambda code for runtime ({runtime}) is not in Zip format")
         # Unzip the Lambda archive contents
-        unzip(tmp_file, lambda_cwd)
+        unzip(archive_file, lambda_cwd)
 
     # Obtain handler details for any non-Java Lambda function
     if not is_java:
         handler_file = get_handler_file_from_name(handler_name, runtime=runtime)
-
         main_file = "%s/%s" % (lambda_cwd, handler_file)
 
         if CHECK_HANDLER_ON_CREATION and not os.path.exists(main_file):
@@ -1106,15 +1073,16 @@ def do_set_function_code(lambda_function: LambdaFunction):
                     use_docker(),
                     config.LAMBDA_REMOTE_DOCKER,
                 )
-                LOG.debug("Lambda archive content:\n%s" % file_list)
+                LOG.debug("Lambda archive content:\n%s", file_list)
                 raise ClientError(
                     error_response(
-                        "Unable to find handler script (%s) in Lambda archive. %s"
-                        % (main_file, config_debug),
+                        f"Unable to find handler script ({main_file}) in Lambda archive. {config_debug}",
                         400,
                         error_type="ValidationError",
                     )
                 )
+
+        # TODO: init code below should be moved into LambdaExecutorLocal!
 
         if runtime.startswith("python") and not use_docker():
             try:
@@ -1154,6 +1122,9 @@ def do_set_function_code(lambda_function: LambdaFunction):
                 return result
 
             lambda_handler = execute_go
+
+    if lambda_handler:
+        lambda_executors.LambdaExecutorLocal.add_function_callable(lambda_function, lambda_handler)
 
     return lambda_handler
 
@@ -1211,6 +1182,7 @@ def format_func_details(
         "LastUpdateStatus": "Successful",
         "PackageType": lambda_function.package_type,
         "ImageConfig": getattr(lambda_function, "image_config", None),
+        "Architectures": lambda_function.architectures,
     }
     if lambda_function.dead_letter_config:
         result["DeadLetterConfig"] = lambda_function.dead_letter_config
@@ -1411,6 +1383,7 @@ def create_function():
             lambda_function.kms_key_arn = None
         lambda_function.memory_size = data.get("MemorySize")
         lambda_function.code_signing_config_arn = data.get("CodeSigningConfigArn")
+        lambda_function.architectures = data.get("Architectures", ["x86_64"])
         lambda_function.code = data["Code"]
         lambda_function.package_type = data.get("PackageType") or "Zip"
         lambda_function.image_config = data.get("ImageConfig", {})
@@ -1504,6 +1477,8 @@ def update_function_code(function):
     result = set_function_code(lambda_function)
     if isinstance(result, Response):
         return result
+    if data.get("Architectures"):
+        lambda_function.architectures = data["Architectures"]
     lambda_function.last_modified = datetime.utcnow()
     result.update(format_func_details(lambda_function))
     if data.get("Publish"):
@@ -1766,10 +1741,12 @@ def invoke_function(function):
     invocation_type = request.headers.get("X-Amz-Invocation-Type", "RequestResponse")
     log_type = request.headers.get("X-Amz-Log-Type")
 
-    def _create_response(invocation_result, status_code=200, headers={}):
+    def _create_response(invocation_result, status_code=200, headers=None):
         """Create the final response for the given invocation result."""
-        if not isinstance(invocation_result, lambda_executors.InvocationResult):
-            invocation_result = lambda_executors.InvocationResult(invocation_result)
+        if headers is None:
+            headers = {}
+        if not isinstance(invocation_result, InvocationResult):
+            invocation_result = InvocationResult(invocation_result)
         result = invocation_result.result
         log_output = invocation_result.log_output
         details = {"StatusCode": status_code, "Payload": result, "Headers": headers}
@@ -1821,13 +1798,30 @@ def invoke_function(function):
     elif qualifier and not region.lambdas.get(arn).qualifier_exists(qualifier):
         not_found = not_found_error("{0}:{1}".format(arn, qualifier))
 
+    # remove this block when AWS updates the stepfunctions image to support aws-sdk invocations
+    if not_found and "localstack-internal-awssdk" in arn:
+        # init aws-sdk stepfunctions handler
+        code = load_file(
+            os.path.join(INSTALL_DIR_STEPFUNCTIONS, "localstack-internal-awssdk", "awssdk.zip"),
+            mode="rb",
+        )
+        lambda_client = aws_stack.connect_to_service("lambda")
+        lambda_client.create_function(
+            FunctionName="localstack-internal-awssdk",
+            Runtime=LAMBDA_RUNTIME_NODEJS14X,
+            Handler="index.handler",
+            Code={"ZipFile": code},
+            Role=LAMBDA_TEST_ROLE,
+        )
+        not_found = None
+
     if not_found:
         try:
             forward_result = forward_to_fallback_url(arn, json.dumps(data))
             if forward_result is not None:
                 return _create_response(forward_result)
         except Exception as e:
-            LOG.debug('Unable to forward Lambda invocation to fallback URL: "%s" - %s' % (data, e))
+            LOG.debug('Unable to forward Lambda invocation to fallback URL: "%s" - %s', data, e)
         return not_found
 
     if invocation_type == "RequestResponse":
@@ -2159,6 +2153,9 @@ def delete_function_event_invoke_config(function):
     region = LambdaRegion.get()
     try:
         function_arn = func_arn(function)
+        if function_arn not in region.lambdas:
+            msg = f"Function not found: {function_arn}"
+            return not_found_error(msg)
         lambda_obj = region.lambdas[function_arn]
     except Exception as e:
         return error_response(str(e), 400)
@@ -2354,11 +2351,29 @@ def update_code_signing_config(arn):
     return Response(json.dumps(result), status=200)
 
 
+def validate_lambda_config():
+    """Validates important config variables necessary for flawless lambda execution"""
+    if (
+        config.LAMBDA_DOCKER_NETWORK
+        and config.is_in_docker
+        and config.LAMBDA_DOCKER_NETWORK
+        not in DOCKER_CLIENT.get_networks(bootstrap.get_main_container_name())
+    ):
+        LOG.warning(
+            "Your specified LAMBDA_DOCKER_NETWORK '%s' is not connected to the main LocalStack container '%s'. "
+            "Lambda functionality might be severely limited.",
+            config.LAMBDA_DOCKER_NETWORK,
+            bootstrap.get_main_container_name(),
+        )
+
+
 def serve(port):
     from localstack.services import generic_proxy  # moved here to fix circular import errors
 
     # initialize the Lambda executor
     LAMBDA_EXECUTOR.startup()
+    # print warnings for potentially incorrect config options
+    validate_lambda_config()
 
     # initialize/import plugins - TODO find better place to import plugins! (to be integrated into proper plugin model)
     import localstack.contrib.thundra  # noqa

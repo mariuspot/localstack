@@ -6,6 +6,7 @@ import glob
 import hashlib
 import inspect
 import io
+import itertools
 import json
 import logging
 import os
@@ -23,15 +24,18 @@ import uuid
 import zipfile
 from contextlib import closing
 from datetime import date, datetime, timezone, tzinfo
+from json import JSONDecodeError
 from multiprocessing.dummy import Pool
 from queue import Queue
 from typing import Any, Callable, Dict, List, Optional, Sized, Tuple, Type, Union
 from urllib.parse import parse_qs, urlparse
 
+import cachetools
 import dns.resolver
 import requests
 import six
 from requests import Response
+from requests.models import CaseInsensitiveDict
 
 import localstack.utils.run
 from localstack import config
@@ -71,6 +75,30 @@ CACHE = {}
 
 # lock for creating certificate files
 SSL_CERT_LOCK = threading.RLock()
+
+# markers that indicate the start/end of sections in PEM cert files
+PEM_CERT_START = "-----BEGIN CERTIFICATE-----"
+PEM_CERT_END = "-----END CERTIFICATE-----"
+PEM_KEY_START_REGEX = r"-----BEGIN(.*)PRIVATE KEY-----"
+PEM_KEY_END_REGEX = r"-----END(.*)PRIVATE KEY-----"
+
+# regular expression for unprintable characters
+# Based on https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html
+#     #x9 | #xA | #xD | #x20 to #xD7FF | #xE000 to #xFFFD | #x10000 to #x10FFFF
+_unprintables = (
+    range(0x00, 0x09),
+    range(0x0A, 0x0A),
+    range(0x0B, 0x0D),
+    range(0x0E, 0x20),
+    range(0xD800, 0xE000),
+    range(0xFFFE, 0x10000),
+)
+REGEX_UNPRINTABLE_CHARS = re.compile(
+    f"[{re.escape(''.join(map(chr, itertools.chain(*_unprintables))))}]"
+)
+IP_REGEX = (
+    r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
+)
 
 # user of the currently running process
 CACHED_USER = None
@@ -148,6 +176,7 @@ class ShellCommandThread(FuncThread):
         self.log_listener = log_listener
         self.stop_listener = stop_listener
         self.strip_color = strip_color
+        self.started = threading.Event()
         FuncThread.__init__(self, self.run_cmd, params, quiet=quiet)
 
     def run_cmd(self, params):
@@ -161,8 +190,7 @@ class ShellCommandThread(FuncThread):
             ):
                 return self.process.returncode if self.process else None
             LOG.info(
-                "Restarting process (received exit code %s): %s"
-                % (self.process.returncode, self.cmd)
+                "Restarting process (received exit code %s): %s", self.process.returncode, self.cmd
             )
 
     def do_run_cmd(self):
@@ -190,6 +218,7 @@ class ShellCommandThread(FuncThread):
                 inherit_cwd=self.inherit_cwd,
                 inherit_env=self.inherit_env,
             )
+            self.started.set()
             if outfile:
                 if outfile == subprocess.PIPE:
                     # get stdout/stderr from child process and write to parent output
@@ -222,9 +251,9 @@ class ShellCommandThread(FuncThread):
         except Exception as e:
             self.result_future.set_exception(e)
             if self.process and not self.quiet:
-                LOG.warning('Shell command error "%s": %s' % (e, self.cmd))
+                LOG.warning('Shell command error "%s": %s', e, self.cmd)
         if self.process and not self.quiet and self.process.returncode != 0:
-            LOG.warning('Shell command exit code "%s": %s' % (self.process.returncode, self.cmd))
+            LOG.warning('Shell command exit code "%s": %s', self.process.returncode, self.cmd)
 
     def is_killed(self):
         if not self.process:
@@ -242,7 +271,7 @@ class ShellCommandThread(FuncThread):
         if self.stopped:
             return
         if not self.process:
-            LOG.warning("No process found for command '%s'" % self.cmd)
+            LOG.warning("No process found for command '%s'", self.cmd)
             return
 
         parent_pid = self.process.pid
@@ -447,6 +476,115 @@ class ArbitraryAccessObj:
         return ArbitraryAccessObj()
 
 
+class HashableList(list):
+    """Hashable list class that can be used with dicts or hashsets."""
+
+    def __hash__(self):
+        result = 0
+        for i in self:
+            result += hash(i)
+        return result
+
+
+class FileMappedDocument(dict):
+    """A dictionary that is mapped to a json document on disk.
+
+    When the document is created, an attempt is made to load existing contents from disk. To load changes from
+    concurrent writes, run load(). To save and overwrite the current document on disk, run save().
+    """
+
+    path: Union[str, os.PathLike]
+
+    def __init__(self, path: Union[str, os.PathLike], mode=0o664):
+        super().__init__()
+        self.path = path
+        self.mode = mode
+        self.load()
+
+    def load(self):
+        if not os.path.exists(self.path):
+            return
+
+        if os.path.isdir(self.path):
+            raise IsADirectoryError
+
+        with open(self.path, "r") as fd:
+            self.update(json.load(fd))
+
+    def save(self):
+        if os.path.isdir(self.path):
+            raise IsADirectoryError
+
+        if not os.path.exists(self.path):
+            mkdir(os.path.dirname(self.path))
+
+        def opener(path, flags):
+            _fd = os.open(path, flags, self.mode)
+            os.chmod(path, mode=self.mode, follow_symlinks=True)
+            return _fd
+
+        with open(self.path, "w", opener=opener) as fd:
+            json.dump(self, fd)
+
+
+class PortNotAvailableException(Exception):
+    """Exception which indicates that the ExternalServicePortsManager could not reserve a port."""
+
+    pass
+
+
+class ExternalServicePortsManager:
+    """Manages the ports used for starting external services like ElasticSearch, OpenSearch,..."""
+
+    def __init__(self):
+        # cache for locally available ports (ports are reserved for a short period of a few seconds)
+        self._PORTS_CACHE = cachetools.TTLCache(maxsize=100, ttl=6)
+        self._PORTS_LOCK = threading.RLock()
+
+    def reserve_port(self, port: int = None) -> int:
+        """
+        Reserves the given port (if it is still free). If the given port is None, it reserves a free port from the
+        configured port range for external services. If a port is given, it has to be within the configured
+        range of external services (i.e. in [config#EXTERNAL_SERVICE_PORTS_START, config#EXTERNAL_SERVICE_PORTS_END)).
+        :param port: explicit port to check or None if a random port from the configured range should be selected
+        :return: reserved, free port number (int)
+        :raises: PortNotAvailableException if the given port is outside the configured range, it is already bound or
+                    reserved, or if the given port is none and there is no free port in the configured service range.
+        """
+        ports_range = range(config.EXTERNAL_SERVICE_PORTS_START, config.EXTERNAL_SERVICE_PORTS_END)
+        if port is not None and port not in ports_range:
+            raise PortNotAvailableException(
+                f"The requested port ({port}) is not in the configured external "
+                f"service port range ({ports_range})."
+            )
+        with self._PORTS_LOCK:
+            if port is not None:
+                return self._check_port(port)
+            else:
+                for port_in_range in ports_range:
+                    try:
+                        return self._check_port(port_in_range)
+                    except PortNotAvailableException:
+                        # We ignore the fact that this single port is reserved, we just check the next one
+                        pass
+        raise PortNotAvailableException(
+            "No free network ports available to start service instance (currently reserved: %s)",
+            list(self._PORTS_CACHE.keys()),
+        )
+
+    def _check_port(self, port: int) -> int:
+        """Checks if the given port is currently not reserved and can be bound."""
+        if not self._PORTS_CACHE.get(port) and port_can_be_bound(port):
+            # reserve the port for a short period of time
+            self._PORTS_CACHE[port] = "__reserved__"
+            return port
+        else:
+            raise PortNotAvailableException(f"The given port ({port}) is already reserved.")
+
+
+external_service_ports = ExternalServicePortsManager()
+
+
 # ----------------
 # UTILITY METHODS
 # ----------------
@@ -555,7 +693,7 @@ def md5(string: Union[str, bytes]) -> str:
 def select_attributes(obj: Dict, attributes: List[str]) -> Dict:
     """Select a subset of attributes from the given dict (returns a copy)"""
     attributes = attributes if is_list_or_tuple(attributes) else [attributes]
-    return dict([(k, v) for k, v in obj.items() if k in attributes])
+    return {k: v for k, v in obj.items() if k in attributes}
 
 
 def remove_attributes(obj: Dict, attributes: List[str], recursive: bool = False) -> Dict:
@@ -606,7 +744,13 @@ def path_from_url(url: str) -> str:
     return "/%s" % str(url).partition("://")[2].partition("/")[2] if "://" in url else url
 
 
-def is_port_open(port_or_url, http_path=None, expect_success=True, protocols=None):
+def is_port_open(
+    port_or_url: Union[int, str],
+    http_path: str = None,
+    expect_success: bool = True,
+    protocols: Optional[List[str]] = None,
+    quiet: bool = True,
+):
     protocols = protocols or ["tcp"]
     port = port_or_url
     if is_number(port):
@@ -639,10 +783,16 @@ def is_port_open(port_or_url, http_path=None, expect_success=True, protocols=Non
                         sock.sendto(bytes(), (host, port))
                         sock.recvfrom(1024)
                 except Exception:
+                    if not quiet:
+                        LOG.exception("Error connecting to UDP port %s:%s", host, port)
                     return False
             elif nw_protocol == socket.SOCK_STREAM:
                 result = sock.connect_ex((host, port))
                 if result != 0:
+                    if not quiet:
+                        LOG.warning(
+                            "Error connecting to TCP port %s:%s (result=%s)", host, port, result
+                        )
                     return False
     if "tcp" not in protocols or not http_path:
         return True
@@ -819,16 +969,22 @@ def poll_condition(condition, timeout: float = None, interval: float = 0.5) -> b
     return True
 
 
-def merge_recursive(source, destination, none_values=[None], overwrite=False):
+def merge_recursive(source, destination, none_values=None, overwrite=False):
+    if none_values is None:
+        none_values = [None]
     for key, value in source.items():
         if isinstance(value, dict):
             # get node or create one
             node = destination.setdefault(key, {})
             merge_recursive(value, node, none_values=none_values, overwrite=overwrite)
         else:
-            if not isinstance(destination, dict):
+            if not isinstance(destination, (dict, CaseInsensitiveDict)):
                 LOG.warning(
-                    "Destination for merging %s=%s is not dict: %s", key, value, destination
+                    "Destination for merging %s=%s is not dict: %s (%s)",
+                    key,
+                    value,
+                    destination,
+                    type(destination),
                 )
             if overwrite or destination.get(key) in none_values:
                 destination[key] = value
@@ -845,6 +1001,10 @@ def merge_dicts(*dicts, **kwargs):
         if d:
             result.update(d)
     return result
+
+
+def remove_none_values_from_dict(dict: Dict) -> Dict:
+    return {k: v for (k, v) in dict.items() if v is not None}
 
 
 def recurse_object(obj: JsonType, func: Callable, path: str = "") -> Any:
@@ -867,7 +1027,7 @@ def keys_to_lower(obj: JsonComplexType, skip_children_of: List[str] = None) -> J
     skip_children_of = ensure_list(skip_children_of or [])
 
     def fix_keys(o, path="", **kwargs):
-        if any([re.match(r"(^|.*\.)%s($|[.\[].*)" % k, path) for k in skip_children_of]):
+        if any(re.match(r"(^|.*\.)%s($|[.\[].*)" % k, path) for k in skip_children_of):
             return o
         if isinstance(o, dict):
             for k, v in dict(o).items():
@@ -879,8 +1039,11 @@ def keys_to_lower(obj: JsonComplexType, skip_children_of: List[str] = None) -> J
     return result
 
 
+_camel_to_snake_case_sub = re.compile("((?<=[a-z0-9])[A-Z]|(?!^)[A-Z](?=[a-z]))")
+
+
 def camel_to_snake_case(string: str) -> str:
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", string).replace("__", "_").lower()
+    return _camel_to_snake_case_sub.sub(r"_\1", string).replace("__", "_").lower()
 
 
 def snake_to_camel_case(string: str, capitalize_first: bool = True) -> str:
@@ -903,6 +1066,22 @@ def obj_to_xml(obj: SerializableObj) -> str:
     if isinstance(obj, dict):
         return "".join(["<{k}>{v}</{k}>".format(k=k, v=obj_to_xml(v)) for (k, v) in obj.items()])
     return str(obj)
+
+
+def strip_xmlns(obj: Any) -> Any:
+    """Strip xmlns attributes from a dict returned by xmltodict.parse."""
+    if isinstance(obj, list):
+        return [strip_xmlns(item) for item in obj]
+    if isinstance(obj, dict):
+        # Remove xmlns attribute.
+        obj.pop("@xmlns", None)
+        if len(obj) == 1 and "#text" in obj:
+            # If the only remaining key is the #text key, elide the dict
+            # entirely, to match the structure that xmltodict.parse would have
+            # returned if the xmlns namespace hadn't been present.
+            return obj["#text"]
+        return {k: strip_xmlns(v) for k, v in obj.items()}
+    return obj
 
 
 def now(millis: bool = False, tz: Optional[tzinfo] = None) -> int:
@@ -942,7 +1121,7 @@ def ensure_readable(file_path: str, default_perms: int = None):
         with open(file_path, "rb"):
             pass
     except Exception:
-        LOG.info("Updating permissions as file is currently not readable: %s" % file_path)
+        LOG.info("Updating permissions as file is currently not readable: %s", file_path)
         os.chmod(file_path, default_perms)
 
 
@@ -981,7 +1160,7 @@ def rm_rf(path: str):
     if not path or not os.path.exists(path):
         return
     # Running the native command can be an order of magnitude faster in Alpine on Travis-CI
-    if is_alpine():
+    if is_debian():
         try:
             return run('rm -rf "%s"' % path)
         except Exception:
@@ -1035,20 +1214,15 @@ def cp_r(src: str, dst: str, rm_dest_on_conflict=False, ignore_copystat_errors=F
                 os.path.islink(_path),
             )
 
-        LOG.debug(
-            "Error copying files from %s to %s: %s"
-            % (
-                _info(src),
-                _info(dst),
-                e,
-            )
-        )
+        LOG.debug("Error copying files from %s to %s: %s", _info(src), _info(dst), e)
         raise
     finally:
         shutil.copystat = copystat_orig
 
 
 def disk_usage(path: str) -> int:
+    """Return the disk usage of the given file or directory."""
+
     if not os.path.exists(path):
         return 0
 
@@ -1063,6 +1237,11 @@ def disk_usage(path: str) -> int:
             if not os.path.islink(fp):
                 total_size += os.path.getsize(fp)
     return total_size
+
+
+def file_exists_not_empty(path: str) -> bool:
+    """Return whether the given file or directory exists and is non-empty (i.e., >0 bytes content)"""
+    return path and disk_usage(path) > 0
 
 
 def format_bytes(count: float, default: str = "n/a"):
@@ -1090,28 +1269,31 @@ def get_proxies() -> Dict[str, str]:
     return proxy_map
 
 
-def download(url: str, path: str, verify_ssl=True):
-    """Downloads file at url to the given path"""
-    # make sure we're creating a new session here to
-    # enable parallel file downloads during installation!
+def download(url: str, path: str, verify_ssl: bool = True, timeout: float = None):
+    """Downloads file at url to the given path. Raises TimeoutError if the optional timeout (in secs) is reached."""
+
+    # make sure we're creating a new session here to enable parallel file downloads
     s = requests.Session()
     proxies = get_proxies()
     if proxies:
         s.proxies.update(proxies)
+
     # Use REQUESTS_CA_BUNDLE path. If it doesn't exist, use the method provided settings.
     # Note that a value that is not False, will result to True and will get the bundle file.
-    r = s.get(url, stream=True, verify=os.getenv("REQUESTS_CA_BUNDLE", verify_ssl))
-    # check status code before attempting to read body
-    if r.status_code >= 400:
-        raise Exception("Failed to download %s, response code %s" % (url, r.status_code))
+    _verify = os.getenv("REQUESTS_CA_BUNDLE", verify_ssl)
 
-    total = 0
+    r = None
     try:
+        r = s.get(url, stream=True, verify=_verify, timeout=timeout)
+        # check status code before attempting to read body
+        if not r.ok:
+            raise Exception("Failed to download %s, response code %s" % (url, r.status_code))
+
+        total = 0
         if not os.path.exists(os.path.dirname(path)):
             os.makedirs(os.path.dirname(path))
         LOG.debug(
-            "Starting download from %s to %s (%s bytes)"
-            % (url, path, r.headers.get("Content-Length"))
+            "Starting download from %s to %s (%s bytes)", url, path, r.headers.get("Content-Length")
         )
         with open(path, "wb") as f:
             iter_length = 0
@@ -1122,21 +1304,24 @@ def download(url: str, path: str, verify_ssl=True):
                 if chunk:  # filter out keep-alive new chunks
                     f.write(chunk)
                 else:
-                    LOG.debug("Empty chunk %s (total %s) from %s" % (chunk, total, url))
+                    LOG.debug("Empty chunk %s (total %s) from %s", chunk, total, url)
                 if iter_length >= iter_limit:
-                    LOG.debug("Written %s bytes (total %s) to %s" % (iter_length, total, path))
+                    LOG.debug("Written %s bytes (total %s) to %s", iter_length, total, path)
                     iter_length = 0
             f.flush()
             os.fsync(f)
         if os.path.getsize(path) == 0:
-            LOG.warning("Zero bytes downloaded from %s, retrying" % url)
+            LOG.warning("Zero bytes downloaded from %s, retrying", url)
             download(url, path, verify_ssl)
             return
         LOG.debug(
-            "Done downloading %s, response code %s, total bytes %d" % (url, r.status_code, total)
+            "Done downloading %s, response code %s, total bytes %d", url, r.status_code, total
         )
+    except requests.exceptions.ReadTimeout as e:
+        raise TimeoutError(f"Timeout ({timeout}) reached on download: {url} - {e}")
     finally:
-        r.close()
+        if r is not None:
+            r.close()
         s.close()
 
 
@@ -1160,7 +1345,7 @@ def parse_request_data(method: str, path: str, data=None, headers=None) -> Dict:
             pass  # probably binary / JSON / non-URL encoded payload - ignore
 
     # select first elements from result lists (this is assuming we are not using parameter lists!)
-    result = dict([(k, v[0]) for k, v in result.items()])
+    result = {k: v[0] for k, v in result.items()}
     return result
 
 
@@ -1189,6 +1374,14 @@ def is_number(s: Any) -> bool:
         return False
 
 
+def to_number(s: Any) -> Union[int, float]:
+    """Cast the string representation of the given object to a number (int or float), or raise ValueError."""
+    try:
+        return int(str(s))
+    except ValueError:
+        return float(str(s))
+
+
 def is_mac_os() -> bool:
     return localstack.utils.run.is_mac_os()
 
@@ -1198,29 +1391,40 @@ def is_linux() -> bool:
 
 
 def is_windows() -> bool:
-    return platform.system().lower() == "windows"
+    return localstack.utils.run.is_windows()
 
 
-def is_alpine() -> bool:
+def is_debian() -> bool:
+    cache_key = "_is_debian_"
     try:
         with MUTEX_CLEAN:
-            if "_is_alpine_" not in CACHE:
-                CACHE["_is_alpine_"] = False
+            if cache_key not in CACHE:
+                CACHE[cache_key] = False
                 if not os.path.exists("/etc/issue"):
                     return False
-                out = to_str(subprocess.check_output("cat /etc/issue", shell=True))
-                CACHE["_is_alpine_"] = "Alpine" in out
+                out = to_str(subprocess.check_output(["cat", "/etc/issue"]))
+                CACHE[cache_key] = "Debian" in out
     except subprocess.CalledProcessError:
         return False
-    return CACHE["_is_alpine_"]
+    return CACHE[cache_key]
 
 
-# TODO: rename to "get_os()"
 def get_arch() -> str:
+    """
+    Returns the current machine architecture
+    :return: "amd64" when x86_64, "arm64" if aarch64, platform.machine() otherwise
+    """
+    arch = platform.machine()
+    if arch == "x86_64":
+        return "amd64"
+    if arch == "aarch64":
+        return "arm64"
+    return arch
+
+
+def get_os() -> str:
     if is_mac_os():
         return "osx"
-    if is_alpine():
-        return "alpine"
     if is_linux():
         return "linux"
     if is_windows():
@@ -1257,6 +1461,19 @@ def parse_json_or_yaml(markup: str) -> JsonComplexType:
                 return clone_safe(yaml.load(markup, Loader=yaml.SafeLoader))
             except Exception:
                 raise
+
+
+def try_json(data: str):
+    """
+    Tries to deserialize json input to object if possible, otherwise returns original
+    :param data: string
+    :return: deserialize version of input
+    """
+    try:
+        return json.loads(to_str(data or "{}"))
+    except JSONDecodeError:
+        LOG.warning("failed serialize to json, fallback to original")
+        return data
 
 
 def json_safe(item: JsonType) -> JsonType:
@@ -1301,8 +1518,10 @@ def assign_to_path(target, path: str, value, delimiter: str = "."):
     parent = extract_from_jsonpointer_path(target, path_to_parent, auto_create=True)
     if not isinstance(parent, dict):
         LOG.debug(
-            'Unable to find parent (type %s) for path "%s" in object: %s'
-            % (type(parent), path, target)
+            'Unable to find parent (type %s) for path "%s" in object: %s',
+            type(parent),
+            path,
+            target,
         )
         return
     path_end = int(parts[-1]) if is_number(parts[-1]) else parts[-1]
@@ -1318,9 +1537,7 @@ def extract_from_jsonpointer_path(target, path: str, delimiter: str = "/", auto_
             if path_part == "-":
                 # special case where path is like /path/to/list/- where "/-" means "append to list"
                 continue
-            LOG.warning(
-                'Attempting to extract non-int index "%s" from list: %s' % (path_part, target)
-            )
+            LOG.warning('Attempting to extract non-int index "%s" from list: %s', path_part, target)
             return None
         target_new = target[path_part] if isinstance(target, list) else target.get(path_part)
         if target_new is None:
@@ -1405,6 +1622,10 @@ def str_remove(string, index, end_index=None):
     """Remove a substring from an existing string at a certain from-to index range."""
     end_index = end_index or (index + 1)
     return "%s%s" % (string[:index], string[end_index:])
+
+
+def str_startswith_ignore_case(value: str, prefix: str) -> bool:
+    return value[: len(prefix)].lower() == prefix.lower()
 
 
 def last_index_of(array, value):
@@ -1534,14 +1755,23 @@ def is_ip_address(addr):
         return False
 
 
+def is_ipv4_address(address: str) -> bool:
+    """
+    Checks if passed string looks like an IPv4 address
+    :param address: Possible IPv4 address
+    :return: True if string looks like IPv4 address, False otherwise
+    """
+    return bool(re.match(IP_REGEX, address))
+
+
 def is_zip_file(content):
     stream = io.BytesIO(content)
     return zipfile.is_zipfile(stream)
 
 
 def unzip(path, target_dir, overwrite=True):
-    is_in_alpine = is_alpine()
-    if is_in_alpine:
+    is_in_debian = is_debian()
+    if is_in_debian:
         # Running the native command can be an order of magnitude faster in Alpine on Travis-CI
         flags = "-o" if overwrite else ""
         flags += " -q"
@@ -1550,19 +1780,19 @@ def unzip(path, target_dir, overwrite=True):
         except Exception as e:
             error_str = truncate(str(e), max_length=200)
             LOG.info(
-                'Unable to use native "unzip" command (using fallback mechanism): %s' % error_str
+                'Unable to use native "unzip" command (using fallback mechanism): %s', error_str
             )
 
     try:
         zip_ref = zipfile.ZipFile(path, "r")
     except Exception as e:
-        LOG.warning("Unable to open zip file: %s: %s" % (path, e))
+        LOG.warning("Unable to open zip file: %s: %s", path, e)
         raise e
 
     def _unzip_file_entry(zip_ref, file_entry, target_dir):
         """Extracts a Zipfile entry and preserves permissions"""
         out_path = os.path.join(target_dir, file_entry.filename)
-        if is_in_alpine and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        if is_in_debian and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             # this can happen under certain circumstances if the native "unzip" command
             # fails with a non-zero exit code, yet manages to extract parts of the zip file
             return
@@ -1617,22 +1847,22 @@ def generate_ssl_cert(
     from OpenSSL import crypto
 
     def all_exist(*files):
-        return all([os.path.exists(f) for f in files])
+        return all(os.path.exists(f) for f in files)
 
     def store_cert_key_files(base_filename):
         key_file_name = "%s.key" % base_filename
         cert_file_name = "%s.crt" % base_filename
-        # TODO: Cleaner code to load the cert dinamically
+        # TODO: Cleaner code to load the cert dynamically
         # extract key and cert from target_file and store into separate files
         content = load_file(target_file)
-        key_start = re.search(r"-----BEGIN(.*)PRIVATE KEY-----", content)
+        key_start = re.search(PEM_KEY_START_REGEX, content)
         key_start = key_start.group(0)
-        key_end = re.search(r"-----END(.*)PRIVATE KEY-----", content)
+        key_end = re.search(PEM_KEY_END_REGEX, content)
         key_end = key_end.group(0)
-        cert_start = "-----BEGIN CERTIFICATE-----"
-        cert_end = "-----END CERTIFICATE-----"
         key_content = content[content.index(key_start) : content.index(key_end) + len(key_end)]
-        cert_content = content[content.index(cert_start) : content.rindex(cert_end) + len(cert_end)]
+        cert_content = content[
+            content.index(PEM_CERT_START) : content.rindex(PEM_CERT_END) + len(PEM_CERT_END)
+        ]
         save_file(key_file_name, key_content)
         save_file(cert_file_name, cert_content)
         return cert_file_name, key_file_name
@@ -1643,7 +1873,7 @@ def generate_ssl_cert(
         except Exception as e:
             # fall back to temporary files if we cannot store/overwrite the files above
             LOG.info(
-                "Error storing key/cert SSL files (falling back to random tmp file names): %s" % e
+                "Error storing key/cert SSL files (falling back to random tmp file names): %s", e
             )
             target_file_tmp = new_tmp_file()
             cert_file_name, key_file_name = store_cert_key_files(target_file_tmp)
@@ -1715,8 +1945,9 @@ def generate_ssl_cert(
                     if i > 0:
                         raise
                     LOG.info(
-                        "Unable to store certificate file under %s, using tmp file instead: %s"
-                        % (target_file, e)
+                        "Unable to store certificate file under %s, using tmp file instead: %s",
+                        target_file,
+                        e,
                     )
                     # Fix for https://github.com/localstack/localstack/issues/1743
                     target_file = "%s.pem" % new_tmp_file()
@@ -1765,7 +1996,7 @@ def run_safe(_python_lambda, *args, _default=None, **kwargs):
         return _python_lambda(*args, **kwargs)
     except Exception as e:
         if print_error:
-            LOG.warning("Unable to execute function: %s" % e)
+            LOG.warning("Unable to execute function: %s", e)
         return _default
 
 
@@ -1878,6 +2109,86 @@ class _RequestsSafe(type):
         return _wrapper
 
 
+class FileListener:
+    """
+    Platform independent `tail -f` command that calls a callback every time a new line is received on the file. If
+    use_tail_command is set (which is the default if we're not on windows and the tail command is available),
+    then a `tail -f` subprocess will be started. Otherwise the tailer library is used that uses polling with retry.
+    """
+
+    def __init__(self, file_path: str, callback: Callable[[str], None]):
+        self.file_path = file_path
+        self.callback = callback
+
+        self.thread: Optional[FuncThread] = None
+        self.started = threading.Event()
+
+        self.use_tail_command = not is_windows() and is_command_available("tail")
+
+    def start(self):
+        self.thread = self._do_start_thread()
+        self.started.wait()
+
+        if self.thread.result_future.done():
+            # this will re-raise exceptions from the run command that occurred before started was set
+            self.thread.result_future.result()
+
+    def join(self, timeout=None):
+        if self.thread:
+            self.thread.join(timeout=timeout)
+
+    def close(self):
+        if self.thread and self.thread.running:
+            self.thread.stop()
+
+        self.started.clear()
+        self.thread = None
+
+    def _do_start_thread(self) -> FuncThread:
+        if self.use_tail_command:
+            thread = self._create_tail_command_thread()
+            thread.start()
+            thread.started.wait(5)
+            self.started.set()
+        else:
+            thread = self._create_tailer_thread()
+            thread.start()
+
+        return thread
+
+    def _create_tail_command_thread(self) -> ShellCommandThread:
+        def _log_listener(line, *args, **kwargs):
+            try:
+                self.callback(line.rstrip("\r\n"))
+            except Exception:
+                pass
+
+        if not os.path.isfile(self.file_path):
+            raise FileNotFoundError
+
+        return ShellCommandThread(
+            cmd=["tail", "-f", self.file_path], quiet=False, log_listener=_log_listener
+        )
+
+    def _create_tailer_thread(self) -> FuncThread:
+        from tailer import Tailer
+
+        tailer = Tailer(open(self.file_path), end=True)
+
+        def _run_follow(*_):
+            try:
+                self.started.set()
+                for line in tailer.follow(delay=0.25):
+                    try:
+                        self.callback(line)
+                    except Exception:
+                        pass
+            finally:
+                tailer.close()
+
+        return FuncThread(func=_run_follow, on_stop=lambda *_: tailer.close())
+
+
 # create class-of-a-class
 class safe_requests(six.with_metaclass(_RequestsSafe)):
     pass
@@ -1932,6 +2243,10 @@ def get_all_subclasses(clazz: Type) -> List[Type]:
     return result
 
 
+def fully_qualified_class_name(klass: Type) -> str:
+    return f"{klass.__module__}.{klass.__name__}"
+
+
 def parallelize(func: Callable, arr: List, size: int = None):
     if not size:
         size = len(arr)
@@ -1965,6 +2280,21 @@ def is_none_or_empty(obj: Union[Optional[str], Optional[list]]) -> bool:
 
 def canonicalize_bool_to_str(val: bool) -> str:
     return "true" if str(val).lower() == "true" else "false"
+
+
+def convert_to_printable_chars(value: Union[List, Dict, str]) -> str:
+    """Removes all unprintable characters from the given string."""
+    if isinstance(value, (dict, list)):
+
+        def _convert(obj, **kwargs):
+            if isinstance(obj, str):
+                return convert_to_printable_chars(obj)
+            return obj
+
+        return recurse_object(value, _convert)
+
+    result = REGEX_UNPRINTABLE_CHARS.sub("", value)
+    return result
 
 
 # Code that requires util functions from above

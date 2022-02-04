@@ -2,10 +2,10 @@ import gzip
 import json
 import unittest
 from datetime import datetime, timedelta
+from urllib.request import Request, urlopen
 
 import requests
 from dateutil.tz import tzutc
-from six.moves.urllib.request import Request, urlopen
 
 from localstack import config
 from localstack.services.cloudwatch.cloudwatch_listener import PATH_GET_RAW_METRICS
@@ -18,7 +18,7 @@ class CloudWatchTest(unittest.TestCase):
         metric_name = "metric-%s" % short_uid()
         namespace = "namespace-%s" % short_uid()
 
-        client = aws_stack.connect_to_service("cloudwatch")
+        client = aws_stack.create_external_boto_client("cloudwatch")
 
         # Put metric data without value
         data = [
@@ -62,15 +62,7 @@ class CloudWatchTest(unittest.TestCase):
 
         url = config.get_edge_url()
         headers = aws_stack.mock_aws_request_headers("cloudwatch")
-
-        authorization = (
-            "AWS4-HMAC-SHA256 Credential=test/20201230/"
-            "us-east-1/monitoring/aws4_request, "
-            "SignedHeaders=content-encoding;host;"
-            "x-amz-content-sha256;x-amz-date, Signature="
-            "bb31fc5f4e58040ede9ed751133fe"
-            "839668b27290bc1406b6ffadc4945c705dc"
-        )
+        authorization = aws_stack.mock_aws_request_headers("monitoring")["Authorization"]
 
         headers.update(
             {
@@ -84,14 +76,14 @@ class CloudWatchTest(unittest.TestCase):
         request = Request(url, encoded_data, headers, method="POST")
         urlopen(request)
 
-        client = aws_stack.connect_to_service("cloudwatch")
+        client = aws_stack.create_external_boto_client("cloudwatch")
         rs = client.list_metrics(Namespace=namespace, MetricName=metric_name)
         self.assertEqual(1, len(rs["Metrics"]))
         self.assertEqual(namespace, rs["Metrics"][0]["Namespace"])
 
     def test_get_metric_data(self):
 
-        conn = aws_stack.connect_to_service("cloudwatch")
+        conn = aws_stack.create_external_boto_client("cloudwatch")
 
         conn.put_metric_data(
             Namespace="some/thing", MetricData=[dict(MetricName="someMetric", Value=23)]
@@ -177,7 +169,7 @@ class CloudWatchTest(unittest.TestCase):
         self.assertGreaterEqual(len(result["metrics"]), 3)
 
     def test_multiple_dimensions(self):
-        client = aws_stack.connect_to_service("cloudwatch")
+        client = aws_stack.create_external_boto_client("cloudwatch")
 
         namespaces = [
             "ns1-%s" % short_uid(),
@@ -207,11 +199,10 @@ class CloudWatchTest(unittest.TestCase):
         rs = client.list_metrics()
         metrics = [m for m in rs["Metrics"] if m.get("Namespace") in namespaces]
         self.assertTrue(metrics)
-        # TODO: needs fixing in moto!
-        # self.assertEqual(len(metrics), len(namespaces) * num_dimensions)
+        self.assertEqual(len(metrics), len(namespaces) * num_dimensions)
 
     def test_store_tags(self):
-        cloudwatch = aws_stack.connect_to_service("cloudwatch")
+        cloudwatch = aws_stack.create_external_boto_client("cloudwatch")
 
         alarm_name = "a-%s" % short_uid()
         response = cloudwatch.put_metric_alarm(
@@ -236,3 +227,43 @@ class CloudWatchTest(unittest.TestCase):
 
         # clean up
         cloudwatch.delete_alarms(AlarmNames=[alarm_name])
+
+    def test_list_metrics_uniqueness(self):
+        cloudwatch = aws_stack.create_external_boto_client("cloudwatch")
+        # create metrics with same namespace and dimensions but different metric names
+        cloudwatch.put_metric_data(
+            Namespace="AWS/EC2",
+            MetricData=[
+                {
+                    "MetricName": "CPUUtilization",
+                    "Dimensions": [{"Name": "InstanceId", "Value": "i-46cdcd06a11207ab3"}],
+                    "Value": 15,
+                }
+            ],
+        )
+        cloudwatch.put_metric_data(
+            Namespace="AWS/EC2",
+            MetricData=[
+                {
+                    "MetricName": "Memory",
+                    "Dimensions": [{"Name": "InstanceId", "Value": "i-46cdcd06a11207ab3"}],
+                    "Value": 30,
+                }
+            ],
+        )
+        results = cloudwatch.list_metrics(Namespace="AWS/EC2")["Metrics"]
+        self.assertEqual(2, len(results))
+        # duplicating existing metric
+        cloudwatch.put_metric_data(
+            Namespace="AWS/EC2",
+            MetricData=[
+                {
+                    "MetricName": "CPUUtilization",
+                    "Dimensions": [{"Name": "InstanceId", "Value": "i-46cdcd06a11207ab3"}],
+                    "Value": 15,
+                }
+            ],
+        )
+        # asserting only unique values are returned
+        results = cloudwatch.list_metrics(Namespace="AWS/EC2")["Metrics"]
+        self.assertEqual(2, len(results))

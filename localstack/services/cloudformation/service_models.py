@@ -2,7 +2,6 @@ import logging
 
 # TODO: remove
 from moto.cloudformation.exceptions import UnformattedGetAttTemplateException
-from moto.core.models import CloudFormationModel
 
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import camel_to_snake_case
@@ -28,7 +27,7 @@ class DependencyNotYetSatisfied(Exception):
         self.resource_ids = resource_ids
 
 
-class GenericBaseModel(CloudFormationModel):
+class GenericBaseModel:
     """Abstract base class representing a resource model class in LocalStack.
     This class keeps references to a combination of (1) the CF resource
     properties (as defined in the template), and (2) the current deployment
@@ -77,7 +76,7 @@ class GenericBaseModel(CloudFormationModel):
     @classmethod
     def cloudformation_type(cls):
         """Return the CloudFormation resource type name, e.g., "AWS::S3::Bucket" (implemented by subclasses)."""
-        return super(GenericBaseModel, cls).cloudformation_type()
+        pass
 
     @staticmethod
     def get_deploy_templates():
@@ -123,7 +122,7 @@ class GenericBaseModel(CloudFormationModel):
             if not template_deployer.check_not_found_exception(
                 e, self.resource_type, self.properties
             ):
-                LOG.debug("Unable to fetch state for resource %s: %s" % (self, e))
+                LOG.debug("Unable to fetch state for resource %s: %s", self, e)
 
     def fetch_state_if_missing(self, *args, **kwargs):
         if not self.state:
@@ -188,6 +187,8 @@ class GenericBaseModel(CloudFormationModel):
     @classmethod
     def resolve_refs_recursively(cls, stack_name, value, resources):
         # TODO: restructure code to avoid circular import here
+        from localstack.services.cloudformation.cloudformation_api import find_stack
         from localstack.utils.cloudformation.template_deployer import resolve_refs_recursively
 
-        return resolve_refs_recursively(stack_name, value, resources)
+        stack = find_stack(stack_name)
+        return resolve_refs_recursively(stack, value)

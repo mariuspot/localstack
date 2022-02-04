@@ -334,9 +334,6 @@ def subscribe_to_shard(data, headers):
     iterator = kinesis.get_shard_iterator(
         StreamName=stream_name, ShardId=data["ShardId"], ShardIteratorType=iter_type, **kwargs
     )["ShardIterator"]
-    data_needs_encoding = False
-    if "java" in headers.get("User-Agent", "").split(" ")[0]:
-        data_needs_encoding = True
 
     def send_events():
         yield convert_to_binary_event_payload("", event_type="initial-response")
@@ -350,8 +347,8 @@ def subscribe_to_shard(data, headers):
             except Exception as e:
                 if "ResourceNotFoundException" in str(e):
                     LOG.debug(
-                        'Kinesis stream "%s" has been deleted, closing shard subscriber'
-                        % stream_name
+                        'Kinesis stream "%s" has been deleted, closing shard subscriber',
+                        stream_name,
                     )
                     return
                 raise
@@ -361,9 +358,8 @@ def subscribe_to_shard(data, headers):
                 record["ApproximateArrivalTimestamp"] = record[
                     "ApproximateArrivalTimestamp"
                 ].timestamp()
-                if data_needs_encoding:
-                    record["Data"] = base64.b64encode(record["Data"])
-                record["Data"] = to_str(record["Data"])
+                # boto3 automatically decodes records in get_records(), so we must re-encode
+                record["Data"] = to_str(base64.b64encode(record["Data"]))
                 last_sequence_number = record["SequenceNumber"]
             if not records:
                 time.sleep(1)

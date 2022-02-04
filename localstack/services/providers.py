@@ -72,16 +72,20 @@ def ec2():
 
 @aws_provider()
 def es():
-    from localstack.services.es import es_starter
+    from localstack.aws.proxy import AwsApiListener
+    from localstack.services.es.provider import EsProvider
 
-    return Service("es", start=es_starter.start_elasticsearch_service)
+    provider = EsProvider()
+    return Service("es", listener=AwsApiListener("es", provider))
 
 
 @aws_provider()
 def firehose():
-    from localstack.services.firehose import firehose_starter
+    from localstack.aws.proxy import AwsApiListener
+    from localstack.services.firehose.provider import FirehoseProvider
 
-    return Service("firehose", start=firehose_starter.start_firehose)
+    provider = FirehoseProvider()
+    return Service("firehose", listener=AwsApiListener("firehose", provider))
 
 
 @aws_provider()
@@ -139,6 +143,15 @@ def logs():
 
 
 @aws_provider()
+def opensearch():
+    from localstack.aws.proxy import AwsApiListener
+    from localstack.services.opensearch.provider import OpensearchProvider
+
+    provider = OpensearchProvider()
+    return Service("opensearch", listener=AwsApiListener("opensearch", provider))
+
+
+@aws_provider()
 def redshift():
     from localstack.services.redshift import redshift_starter
 
@@ -152,6 +165,13 @@ def route53():
     return Service(
         "route53", listener=route53_listener.UPDATE_ROUTE53, start=route53_starter.start_route53
     )
+
+
+@aws_provider()
+def route53resolver():
+    from localstack.services.route53 import route53_starter
+
+    return Service("route53resolver", start=route53_starter.start_route53_resolver)
 
 
 @aws_provider()
@@ -201,6 +221,16 @@ def sqs():
     )
 
 
+@aws_provider(api="sqs", name="asf")
+def sqs_asf():
+    from localstack.aws.proxy import AwsApiListener
+    from localstack.services.sqs.provider import SqsProvider
+
+    provider = SqsProvider()
+
+    return Service("sqs", listener=AwsApiListener("sqs", provider), lifecycle_hook=provider)
+
+
 @aws_provider()
 def ssm():
     from localstack.services.ssm import ssm_listener, ssm_starter
@@ -231,13 +261,11 @@ def stepfunctions():
 
 @aws_provider()
 def swf():
-    from localstack.services.swf import swf_listener, swf_starter
+    from localstack.services.swf import swf_starter
 
     return Service(
         "swf",
-        listener=swf_listener.UPDATE_SWF,
         start=swf_starter.start_swf,
-        check=swf_starter.check_swf,
     )
 
 

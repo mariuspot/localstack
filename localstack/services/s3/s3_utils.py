@@ -3,12 +3,12 @@ import logging
 import re
 import time
 from collections import namedtuple
+from urllib import parse as urlparse
 from urllib.parse import parse_qs, urlencode
 
 from botocore.awsrequest import create_request_object
 from botocore.compat import urlsplit
 from botocore.credentials import Credentials
-from six.moves.urllib import parse as urlparse
 
 from localstack import config
 from localstack.constants import (
@@ -168,12 +168,20 @@ def get_bucket_website_hostname(bucket_name):
 
 def get_forwarded_for_host(headers):
     x_forwarded_header = re.split(r",\s?", headers.get("X-Forwarded-For", ""))
-    host = x_forwarded_header[len(x_forwarded_header) - 1]
+    host = x_forwarded_header[-1]
     return host
 
 
 def is_real_s3_url(url):
     return re.match(r".*s3(\-website)?\.([^\.]+\.)?amazonaws.com.*", url or "")
+
+
+def get_key_from_s3_url(url: str, leading_slash: bool = False) -> str:
+    """Extract the object key from an S3 URL"""
+    result = re.sub(r"^s3://[^/]+", "", url, flags=re.IGNORECASE).strip()
+    result = result.lstrip("/")
+    result = f"/{result}" if leading_slash else result
+    return result
 
 
 def is_expired(expiry_datetime):
@@ -190,13 +198,13 @@ def authenticate_presign_url(method, path, headers, data=None):
     if forwarded_for:
         url = re.sub("://[^/]+", "://%s" % forwarded_for, url)
 
-    LOGGER.debug("Received presign S3 URL: %s" % url)
+    LOGGER.debug("Received presign S3 URL: %s", url)
 
     sign_headers = {}
     query_string = {}
 
-    is_v2 = all([p in query_params for p in SIGNATURE_V2_PARAMS])
-    is_v4 = all([p in query_params for p in SIGNATURE_V4_PARAMS])
+    is_v2 = all(p in query_params for p in SIGNATURE_V2_PARAMS)
+    is_v4 = all(p in query_params for p in SIGNATURE_V4_PARAMS)
 
     # Add overrided headers to the query string params
     for param_name, header_name in ALLOWED_HEADER_OVERRIDES.items():
@@ -248,11 +256,10 @@ def authenticate_presign_url(method, path, headers, data=None):
     request_url = "{}://{}{}".format(parsed.scheme, parsed.netloc, parsed.path)
     # Fix https://github.com/localstack/localstack/issues/3912
     # urlencode method replaces white spaces with plus sign cause signature calculation to fail
-    request_url = (
-        "%s?%s" % (request_url, urlencode(query_string, quote_via=urlparse.quote, safe=" "))
-        if query_string
-        else request_url
+    query_string_encoded = (
+        urlencode(query_string, quote_via=urlparse.quote, safe=" ") if query_string else None
     )
+    request_url = "%s?%s" % (request_url, query_string_encoded) if query_string else request_url
     if forwarded_for:
         request_url = re.sub("://[^/]+", "://%s" % forwarded_for, request_url)
 
@@ -286,12 +293,12 @@ def authenticate_presign_url(method, path, headers, data=None):
             request_dict["url_path"],
         )
         request_dict["url"] = (
-            "%s?%s" % (request_dict["url"], urlencode(query_string))
+            "%s?%s" % (request_dict["url"], query_string_encoded)
             if query_string
             else request_dict["url"]
         )
 
-    if not is_v2 and any([p in query_params for p in SIGNATURE_V2_PARAMS]):
+    if not is_v2 and any(p in query_params for p in SIGNATURE_V2_PARAMS):
         response = requests_error_response_xml_signature_calculation(
             code=403,
             message="Query-string authentication requires the Signature, Expires and AWSAccessKeyId parameters",
@@ -302,7 +309,7 @@ def authenticate_presign_url(method, path, headers, data=None):
             method, path, headers, data, url, query_params, request_dict
         )
 
-    if not is_v4 and any([p in query_params for p in SIGNATURE_V4_PARAMS]):
+    if not is_v4 and any(p in query_params for p in SIGNATURE_V4_PARAMS):
         response = requests_error_response_xml_signature_calculation(
             code=403,
             message="Query-string authentication requires the X-Amz-Algorithm, \
@@ -317,7 +324,7 @@ def authenticate_presign_url(method, path, headers, data=None):
         )
 
     if response is not None:
-        LOGGER.info("Presign signature calculation failed: %s" % response)
+        LOGGER.info("Presign signature calculation failed: %s", response)
         return response
     LOGGER.debug("Valid presign url.")
 
@@ -361,12 +368,17 @@ def authenticate_presign_url_signv2(method, path, headers, data, url, query_para
 
     # Checking whether the url is expired or not
     if int(query_params["Expires"][0]) < time.time():
-        return requests_error_response_xml_signature_calculation(
-            code=403,
-            code_string="AccessDenied",
-            message="Request has expired",
-            expires=query_params["Expires"][0],
-        )
+        if config.S3_SKIP_SIGNATURE_VALIDATION:
+            LOGGER.warning(
+                "Signature is expired, but not raising an error, as S3_SKIP_SIGNATURE_VALIDATION=1"
+            )
+        else:
+            return requests_error_response_xml_signature_calculation(
+                code=403,
+                code_string="AccessDenied",
+                message="Request has expired",
+                expires=query_params["Expires"][0],
+            )
 
 
 def authenticate_presign_url_signv4(method, path, headers, data, url, query_params, request_dict):
@@ -426,9 +438,14 @@ def authenticate_presign_url_signv4(method, path, headers, data, url, query_para
 
     # Checking whether the url is expired or not
     if is_expired(expiration_time):
-        return requests_error_response_xml_signature_calculation(
-            code=403,
-            code_string="AccessDenied",
-            message="Request has expired",
-            expires=query_params["X-Amz-Expires"][0],
-        )
+        if config.S3_SKIP_SIGNATURE_VALIDATION:
+            LOGGER.warning(
+                "Signature is expired, but not raising an error, as S3_SKIP_SIGNATURE_VALIDATION=1"
+            )
+        else:
+            return requests_error_response_xml_signature_calculation(
+                code=403,
+                code_string="AccessDenied",
+                message="Request has expired",
+                expires=query_params["X-Amz-Expires"][0],
+            )
